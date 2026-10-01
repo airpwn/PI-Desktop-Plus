@@ -9,6 +9,7 @@ const [
   releaseWorkflowSource,
   desktopPackageSource,
   linuxPackageWorkflowSource,
+  linuxReleaseWorkflowSource,
   mirrorToCnbWorkflowSource,
   agentRuntimePackageSource,
   i18nPackageSource,
@@ -21,6 +22,7 @@ const [
   read("../../../.github/workflows/release.yml"),
   read("../package.json"),
   read("../../../.github/workflows/linux-package.yml"),
+  read("../../../.github/workflows/linux-release.yml"),
   read("../../../.github/workflows/mirror-to-cnb.yml"),
   read("../../../packages/agent-runtime/package.json"),
   read("../../../packages/i18n/package.json"),
@@ -366,7 +368,11 @@ test("the signed local macOS lane selects the native runner architecture", () =>
  */
 test("both macOS lanes only reference scripts that exist", async () => {
   const referenced = new Set();
-  for (const source of [releaseMacScriptSource, releaseWorkflowSource]) {
+  for (const source of [
+    releaseMacScriptSource,
+    releaseWorkflowSource,
+    linuxReleaseWorkflowSource,
+  ]) {
     for (const match of source.matchAll(/(?<![\w./-])scripts\/[A-Za-z0-9._-]+\.(?:sh|mjs)/g)) {
       referenced.add(match[0]);
     }
@@ -397,6 +403,120 @@ test("macOS signing instrumentation stays out of the Windows and Linux lanes", (
   const unsignedBlock = stepBlock("Package unsigned macOS installer");
   assert.ok(unsignedBlock, "unsigned macOS debug package step is missing");
   assert.doesNotMatch(unsignedBlock, instrumentation);
+});
+
+test("the Linux release lane publishes AppImage and deb installers as pi-desktop-plus", () => {
+  // release.yml stays the multi-platform authority: it needs the Apple signing
+  // secrets, so the Linux-only lane must not add a tag trigger that would
+  // package Linux twice for the same commit.
+  assert.match(
+    linuxReleaseWorkflowSource,
+    /^on:\n  workflow_dispatch:\n    inputs:\n      tag:[\s\S]*?      publish:[\s\S]*?default:\s*true[\s\S]*?type:\s*boolean/m,
+  );
+  assert.doesNotMatch(linuxReleaseWorkflowSource, /^ {2}push:$/m);
+  assert.doesNotMatch(
+    linuxReleaseWorkflowSource,
+    /macos|windows|dist:mac|dist:win/,
+    "the Linux lane packages Linux only",
+  );
+  // ubuntu-22.04 keeps host-core at the advertised glibc 2.35 floor.
+  assert.match(linuxReleaseWorkflowSource, /runs-on: ubuntu-22\.04/);
+  assert.match(
+    linuxReleaseWorkflowSource,
+    /cargo build --release --locked -p host-core &/,
+  );
+  assert.match(
+    linuxReleaseWorkflowSource,
+    /pnpm --filter '@pi-desktop\/desktop\^\.\.\.' --fail-if-no-match build/,
+  );
+  assert.match(
+    linuxReleaseWorkflowSource,
+    /run: pnpm --filter @pi-desktop\/desktop run dist:linux -- --x64/,
+  );
+  assert.match(
+    linuxReleaseWorkflowSource,
+    /run: node scripts\/check-linux-host-glibc\.mjs target\/release\/pi-desktop-host-core/,
+  );
+
+  // Publication is explicit: an empty tag builds artifacts only, a tag that
+  // disagrees with the desktop version fails before packaging.
+  assert.match(
+    linuxReleaseWorkflowSource,
+    /Tag \$tag does not match apps\/desktop\/package\.json version \$app_version/,
+  );
+  assert.match(
+    linuxReleaseWorkflowSource,
+    /run: node scripts\/check-release-docs\.mjs "\$\{RELEASE_TAG#v\}"/,
+  );
+  assert.match(
+    linuxReleaseWorkflowSource,
+    /^      - name: Verify release documents describe the published version\n {8}if: steps\.release\.outputs\.publish == 'true'/m,
+  );
+
+  // Every artifact identity check the release surface depends on.
+  assert.match(linuxReleaseWorkflowSource, /Expected exactly one AppImage/);
+  assert.match(linuxReleaseWorkflowSource, /Expected exactly one deb/);
+  assert.match(linuxReleaseWorkflowSource, /pi-desktop-plus\*"\$\{version\}"\*/);
+  assert.match(linuxReleaseWorkflowSource, /7f454c46/);
+  assert.match(linuxReleaseWorkflowSource, /dpkg-deb --field "\$deb" Package/);
+  assert.match(
+    linuxReleaseWorkflowSource,
+    /deb Package is \$\{deb_package\}, expected pi-desktop-plus/,
+  );
+  assert.match(
+    linuxReleaseWorkflowSource,
+    /opt\/Pi-Desktop-Plus\/resources\/bin\/pi-desktop-host-core/,
+  );
+  assert.match(
+    linuxReleaseWorkflowSource,
+    /opt\/Pi-Desktop-Plus\/resources\/app\.asar/,
+  );
+  assert.match(linuxReleaseWorkflowSource, /Icon=pi-desktop-plus/);
+  assert.match(linuxReleaseWorkflowSource, /StartupWMClass=pi-desktop-plus/);
+  assert.match(
+    linuxReleaseWorkflowSource,
+    /apps\/desktop\/release\/\*\.AppImage\n\s+apps\/desktop\/release\/\*\.deb/,
+  );
+  assert.match(
+    linuxReleaseWorkflowSource,
+    /if-no-files-found: error\n {10}# AppImage and deb are already compressed\.\n {10}compression-level: 0/,
+  );
+
+  // Least privilege plus a gated, write-scoped publish job.
+  assert.match(
+    linuxReleaseWorkflowSource,
+    /^permissions:\n  contents: read$/m,
+  );
+  const publishJob = linuxReleaseWorkflowSource.match(/^  publish:\n[\s\S]*$/m)?.[0];
+  assert.ok(publishJob, "Linux release publish job is missing");
+  assert.match(publishJob, /^    if: needs\.build\.outputs\.publish == 'true'$/m);
+  assert.match(publishJob, /^    permissions:\n      contents: write$/m);
+  assert.match(publishJob, /uses: softprops\/action-gh-release@v3/);
+  assert.match(publishJob, /tag_name: \$\{\{ needs\.build\.outputs\.tag \}\}/);
+  assert.match(publishJob, /files: dist\/\*/);
+  assert.match(
+    publishJob,
+    /prerelease: \$\{\{ contains\(needs\.build\.outputs\.tag, '-'\) \}\}/,
+  );
+
+  // The lane must not carry the macOS signing instrumentation.
+  assert.doesNotMatch(
+    linuxReleaseWorkflowSource,
+    /macos-signing-watchdog|macos-signing-diagnostics|macos-bundle-inventory|notarize/,
+  );
+
+  // The AppImage name is explicit so the artifact identity gate above, the
+  // updater feed, and the published asset cannot drift apart silently.
+  assert.equal(
+    JSON.parse(desktopPackageSource).build.appImage.artifactName,
+    "pi-desktop-plus_${version}_${arch}.${ext}",
+    "AppImage artifactName",
+  );
+  assert.equal(
+    JSON.parse(desktopPackageSource).build.deb.artifactName,
+    "pi-desktop-plus_${version}_${arch}.${ext}",
+    "AppImage and deb share the pi-desktop-plus artifact identity",
+  );
 });
 
 test("GitHub releases trigger the CNB mirror pipeline with a JSON payload", () => {

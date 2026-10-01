@@ -20,6 +20,7 @@
 | Local package | `pnpm --filter @pi-desktop/desktop pack` | unsigned without a configured certificate | packaging smoke (`--dir` output) |
 | Local DMG | `pnpm --filter @pi-desktop/desktop dist` | unsigned without a configured certificate | local install test |
 | Release | `scripts/release-macos.sh` | Developer ID + mandatory notarization | distributable artifact |
+| Linux release | `.github/workflows/linux-release.yml` | none (unsigned Linux packages) | AppImage + deb installers for the fork |
 
 The static electron-builder config does not embed a certificate identity, so
 contributors without certificates can still package locally. The release lane
@@ -608,6 +609,39 @@ Native-runner output matrix:
   ZIP `Pi-Desktop-Plus-Portable-<version>.zip`
 - Linux x64: AppImage, deb, and rpm
 - Linux x64 system Electron asset: `Pi-Desktop-Plus-<version>-linux-x64.asar`
+
+### 6.1 Linux-only release lane
+
+`.github/workflows/linux-release.yml` packages the two Linux installers a Plus
+user can install directly — the AppImage and the deb — and publishes them to a
+GitHub Release. `release.yml` remains the multi-platform authority: it requires
+the Apple Developer ID secrets, so a fork without them can never finish its
+macOS jobs. This lane therefore stays dispatch-only, and a `v*.*.*` tag push
+still runs `release.yml` alone, so one commit is never packaged twice. Ordinary
+`ci.yml` gates the branch it is dispatched from.
+
+Run it from the Actions tab: **Linux release (AppImage + deb)** →
+**Run workflow**.
+
+| Input | Effect |
+|---|---|
+| `tag` | Tag to publish under, for example `v0.15.6`. It must match `apps/desktop/package.json`; GitHub creates the tag at the dispatched commit when it does not exist yet. Empty means "upload workflow artifacts only". |
+| `publish` | `false` builds and uploads the installers without touching a GitHub Release. |
+
+The job runs on `ubuntu-22.04` so the bundled host-core keeps the advertised
+glibc 2.35 floor, and it refuses to package when the tag disagrees with the app
+version or when `scripts/check-release-docs.mjs` finds a version surface that
+does not describe the published version. After packaging it requires exactly one
+`pi-desktop-plus_<version>_amd64.AppImage` and one
+`pi-desktop-plus_<version>_amd64.deb`, checks the AppImage ELF payload, checks
+the deb `Package`, `Architecture`, `/opt/Pi-Desktop-Plus` payload, and desktop
+entry, and requires any `latest*.yml` feed to reference the AppImage. The `rpm`
+target that the shared `dist:linux` configuration also builds stays out of this
+release; add it to the publish job when the fork wants it.
+
+`build.appImage.artifactName` pins the AppImage file name to
+`pi-desktop-plus_${version}_${arch}.${ext}`, the identity the deb and rpm
+entries already use, instead of electron-builder's `productFilename` default.
 
 The portable Windows ZIP target does not write `latest.yml`. The Windows
 release helper builds NSIS and ZIP separately and stamps the ZIP app metadata

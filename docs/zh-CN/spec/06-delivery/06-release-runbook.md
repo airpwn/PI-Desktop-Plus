@@ -19,6 +19,7 @@
 | 本地打包 | `pnpm --filter @pi-desktop/desktop pack` | 未配置证书时未签名 | 打包冒烟测试（`--dir` 输出） |
 | 本地 DMG | `pnpm --filter @pi-desktop/desktop dist` | 未配置证书时未签名 | 本地安装测试 |
 | 发布 | `scripts/release-macos.sh` | Developer ID + 强制公证 | 可分发产物 |
+| Linux 发布 | `.github/workflows/linux-release.yml` | 无（Linux 包未签名） | fork 的 AppImage + deb 安装包 |
 
 静态 electron-builder 配置不嵌入证书身份，因此没有证书的贡献者仍可在本地打包。
 发布通道需要注入 Developer ID 身份（本地）或 `CSC_LINK` 证书（CI）；签名或公证验证
@@ -512,6 +513,35 @@ Native-runner 输出矩阵：
   ZIP `Pi-Desktop-Plus-Portable-<version>.zip`
 - Linux x64：AppImage、deb 和 rpm
 - Linux x64 系统 Electron 产物：`Pi-Desktop-Plus-<version>-linux-x64.asar`
+
+### 6.1 仅 Linux 发布通道
+
+`.github/workflows/linux-release.yml` 只打包 Plus 用户可直接安装的两个 Linux
+安装包——AppImage 与 deb——并将它们发布到 GitHub Release。
+`release.yml` 仍是多平台权威通道：它需要 Apple Developer ID 密钥，因此没有这些
+密钥的 fork 永远无法跑完其 macOS 作业。所以本通道仅支持手动触发，
+`v*.*.*` 标记推送仍然只运行 `release.yml`，同一个提交不会被打包两次。
+日常 `ci.yml` 会门禁被触发分支。
+
+在 Actions 页面运行：**Linux release (AppImage + deb)** → **Run workflow**。
+
+| 输入 | 作用 |
+|---|---|
+| `tag` | 用于发布的标记，例如 `v0.15.6`。必须与 `apps/desktop/package.json` 一致；若该标记尚不存在，GitHub 会在被触发的提交上创建它。留空表示“仅上传 workflow 构件”。 |
+| `publish` | `false` 只构建并上传安装包，不接触任何 GitHub Release。 |
+
+该作业在 `ubuntu-22.04` 上运行，使内置的 host-core 保持对外声明的 glibc 2.35
+下限；当标记与应用版本不一致，或 `scripts/check-release-docs.mjs` 发现某个版本
+面未描述待发布版本时，作业会在打包前拒绝执行。打包后它要求恰好存在一个
+`pi-desktop-plus_<version>_amd64.AppImage` 和一个
+`pi-desktop-plus_<version>_amd64.deb`，校验 AppImage 的 ELF 负载，校验 deb 的
+`Package`、`Architecture`、`/opt/Pi-Desktop-Plus` 负载与桌面条目，并要求任何
+`latest*.yml` 更新源引用该 AppImage。共享 `dist:linux` 配置同时构建的 `rpm`
+目标不包含在本次发布中；fork 需要时再将其加入 publish 作业。
+
+`build.appImage.artifactName` 将 AppImage 文件名固定为
+`pi-desktop-plus_${version}_${arch}.${ext}`，与 deb、rpm 条目已使用的标识一致，
+而不是 electron-builder 默认的 `productFilename`。
 
 便携版 Windows ZIP 目标不会写入 `latest.yml`。Windows 发布脚本会分别构建 NSIS
 和 ZIP，并给 ZIP 的应用元数据写入 `piDistribution = "zip"`；已打包的 ZIP 运行使用

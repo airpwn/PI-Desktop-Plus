@@ -261,6 +261,14 @@ test("packaging publishes an electron-updater feed for GitHub Releases", () => {
     "pi-desktop-plus-${version}-${arch}.${ext}",
     "rpm artifactName",
   );
+  // The AppImage name is explicit instead of electron-builder's
+  // productFilename default so the Linux release lane can gate the published
+  // asset name and the updater feed on the pi-desktop-plus identity.
+  assert.equal(
+    pkg.build.appImage.artifactName,
+    "pi-desktop-plus_${version}_${arch}.${ext}",
+    "AppImage artifactName",
+  );
   assert.deepEqual(
     pkg.build.rpm.fpm,
     ["--rpm-rpmbuild-define", "_build_id_links none"],
