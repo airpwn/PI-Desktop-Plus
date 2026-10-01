@@ -242,6 +242,9 @@
       "packageName": "pi-desktop-plus",
       "artifactName": "pi-desktop-plus_${version}_${arch}.${ext}"
     },
+    "appImage": {
+      "artifactName": "pi-desktop-plus_${version}_${arch}.${ext}"
+    },
     "rpm": {
       "packageName": "pi-desktop-plus",
       "artifactName": "pi-desktop-plus-${version}-${arch}.${ext}",

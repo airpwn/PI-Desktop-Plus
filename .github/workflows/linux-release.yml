@@ -1,0 +1,302 @@
+name: Linux release (AppImage + deb)
+
+# Linux-only release lane for the Plus fork.
+#
+# `.github/workflows/release.yml` stays the multi-platform release authority:
+# it packages macOS and Windows on their native runners and requires the Apple
+# Developer ID secrets, so a fork without those secrets can never get past its
+# macOS jobs. This lane reuses the same `dist:linux` build and the same gates
+# (locked host-core build, glibc floor, artifact identity) for the two Linux
+# installers a Plus user can install directly: the AppImage and the deb.
+#
+# It is dispatch-only on purpose. A `v*.*.*` tag push would run this lane and
+# `release.yml` in parallel and package Linux twice for the same commit; the
+# tag remains `release.yml`'s trigger. Ordinary CI (`ci.yml`) gates the branch
+# this lane is dispatched from, so this workflow only adds packaging plus the
+# release-document gate.
+#
+# Release notes stay out of scope: `apps/desktop/package.json` version,
+# `packages/shared/src/changelog*.ts`, `README.md`, and `README.zh-CN.md` must
+# already describe the version this lane publishes
+# (docs/spec/06-delivery/06-release-runbook.md section 4.1). The publish job
+# only runs `check-release-docs` against the requested tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish the release under, for example v0.15.6. Leave empty to only upload workflow artifacts.'
+        required: false
+        type: string
+      publish:
+        description: 'Create or update the GitHub Release for the tag'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-release-${{ github.ref }}-${{ inputs.tag || 'build' }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Linux x64 installers
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      publish: ${{ steps.release.outputs.publish }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          # Match the Node that Electron 43 bundles (24.18), so the installers
+          # are built against the runtime the app actually ships.
+          node-version: 24
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve release inputs
+        id: release
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          tag="${DISPATCH_TAG:-}"
+          if [[ -z "$tag" || "$PUBLISH_REQUESTED" != "true" ]]; then
+            echo "::notice::No release requested. The installers are uploaded as workflow artifacts only."
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$tag" != v* ]]; then
+            echo "::error::Tag $tag must start with v, for example v$(node -p "require('./apps/desktop/package.json').version")."
+            exit 1
+          fi
+          version="${tag#v}"
+          app_version="$(node -p "require('./apps/desktop/package.json').version")"
+          if [[ "$version" != "$app_version" ]]; then
+            echo "::error::Tag $tag does not match apps/desktop/package.json version $app_version."
+            echo "::error::Run 'node scripts/release.mjs $version --tag' to bump versions before publishing."
+            exit 1
+          fi
+          echo "Publishing tag $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare package inputs
+        run: |
+          set -euo pipefail
+          # Ubuntu 22.04 keeps host-core at glibc 2.35 so Ubuntu 22.04,
+          # Debian 12, and Fedora 36+ can load the bundled binary. A newer
+          # runner would silently raise that floor.
+          # --locked mirrors release.yml: a drifted Cargo.lock fails here
+          # instead of being rewritten by the packaging script.
+          cargo build --release --locked -p host-core &
+          host_build_pid=$!
+          trap 'kill "$host_build_pid" 2>/dev/null || true' EXIT
+
+          pnpm install --frozen-lockfile
+          pnpm --filter '@pi-desktop/desktop^...' --fail-if-no-match build
+
+          wait "$host_build_pid"
+          trap - EXIT
+
+      - name: Verify release documents describe the published version
+        if: steps.release.outputs.publish == 'true'
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: node scripts/check-release-docs.mjs "${RELEASE_TAG#v}"
+
+      - name: Install packaging prerequisites
+        run: |
+          set -euo pipefail
+          # electron-builder drives the rpm target through fpm; the AppImage and
+          # deb targets do not need a system rpm toolchain.
+          if ! command -v fakeroot >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y fakeroot
+          fi
+
+      - name: Package Linux x64 installers
+        # `--publish never`: this workflow owns publication through the
+        # publish job, and electron-builder must not self-publish.
+        run: pnpm --filter @pi-desktop/desktop run dist:linux -- --x64
+
+      - name: Verify Linux host-core glibc floor
+        run: node scripts/check-linux-host-glibc.mjs target/release/pi-desktop-host-core
+
+      - name: Verify AppImage and deb artifacts
+        run: |
+          set -euo pipefail
+          release_dir=apps/desktop/release
+          version="$(node -p "require('./apps/desktop/package.json').version")"
+
+          shopt -s nullglob
+          appimages=("$release_dir"/*.AppImage)
+          debs=("$release_dir"/*.deb)
+          printf '%s\n' "$release_dir"/* || true
+          if [[ "${#appimages[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one AppImage, found ${#appimages[@]}."
+            exit 1
+          fi
+          if [[ "${#debs[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one deb, found ${#debs[@]}."
+            exit 1
+          fi
+
+          appimage="${appimages[0]}"
+          deb="${debs[0]}"
+          appimage_name="$(basename "$appimage")"
+          deb_name="$(basename "$deb")"
+
+          # The fork ships as pi-desktop-plus. A future rename must update this
+          # gate, the desktop package.json naming, and the workflow together.
+          for artifact in "$appimage_name" "$deb_name"; do
+            case "$artifact" in
+              pi-desktop-plus*"${version}"*)
+                printf '::notice::%s\n' "$artifact"
+                ;;
+              *)
+                echo "::error::Artifact $artifact must be named pi-desktop-plus with version ${version}."
+                exit 1
+                ;;
+            esac
+          done
+
+          # The AppImage is an ELF with the runtime appended, so a truncated or
+          # wrongly assembled payload fails here instead of at first launch.
+          magic="$(head -c 4 "$appimage" | od -An -tx1 | tr -d ' \n')"
+          if [[ "$magic" != "7f454c46" ]]; then
+            echo "::error::$appimage_name is not an ELF AppImage (magic ${magic})."
+            exit 1
+          fi
+          if [[ ! -x "$appimage" ]]; then
+            echo "::error::$appimage_name is not executable."
+            exit 1
+          fi
+          appimage_bytes="$(stat -c %s "$appimage")"
+          if (( appimage_bytes < 50 * 1024 * 1024 )); then
+            echo "::error::$appimage_name is ${appimage_bytes} bytes, too small to carry the app payload."
+            exit 1
+          fi
+
+          deb_package="$(dpkg-deb --field "$deb" Package)"
+          deb_version="$(dpkg-deb --field "$deb" Version)"
+          deb_arch="$(dpkg-deb --field "$deb" Architecture)"
+          echo "deb ${deb_package} ${deb_version} ${deb_arch}"
+          if [[ "$deb_package" != "pi-desktop-plus" ]]; then
+            echo "::error::deb Package is ${deb_package}, expected pi-desktop-plus."
+            exit 1
+          fi
+          if [[ "$deb_arch" != "amd64" ]]; then
+            echo "::error::deb Architecture is ${deb_arch}, expected amd64."
+            exit 1
+          fi
+
+          deb_root="$(mktemp -d)"
+          dpkg-deb --extract "$deb" "$deb_root"
+          for relative_path in \
+            opt/Pi-Desktop-Plus/pi-desktop-plus \
+            opt/Pi-Desktop-Plus/resources/app.asar \
+            opt/Pi-Desktop-Plus/resources/bin/pi-desktop-host-core \
+            usr/share/applications/pi-desktop-plus.desktop \
+            usr/share/icons/hicolor/512x512/apps/pi-desktop-plus.png; do
+            if [[ ! -e "$deb_root/$relative_path" ]]; then
+              echo "::error::$deb_name does not contain ${relative_path}."
+              exit 1
+            fi
+          done
+          if [[ ! -x "$deb_root/opt/Pi-Desktop-Plus/pi-desktop-plus" ]]; then
+            echo "::error::$deb_name does not ship an executable opt/Pi-Desktop-Plus/pi-desktop-plus."
+            exit 1
+          fi
+          desktop_entry="$deb_root/usr/share/applications/pi-desktop-plus.desktop"
+          grep -Fx 'Icon=pi-desktop-plus' "$desktop_entry"
+          grep -Fx 'StartupWMClass=pi-desktop-plus' "$desktop_entry"
+          rm -rf "$deb_root"
+
+      - name: Verify the AppImage update feed
+        run: |
+          set -euo pipefail
+          release_dir=apps/desktop/release
+          shopt -s nullglob
+          feeds=("$release_dir"/latest*.yml)
+          appimages=("$release_dir"/*.AppImage)
+          if [[ "${#feeds[@]}" -eq 0 ]]; then
+            echo "::warning::No electron-updater feed was produced; AppImage in-app updates stay unavailable for this build."
+            exit 0
+          fi
+          for feed in "${feeds[@]}"; do
+            if ! grep -Fq "$(basename "${appimages[0]}")" "$feed"; then
+              echo "::error::$(basename "$feed") does not reference $(basename "${appimages[0]}")."
+              exit 1
+            fi
+            echo "::notice::$(basename "$feed") references $(basename "${appimages[0]}")"
+          done
+
+      - name: Upload Linux installers
+        uses: actions/upload-artifact@v7
+        with:
+          name: pi-desktop-plus-linux-x64-installer
+          if-no-files-found: error
+          # AppImage and deb are already compressed.
+          compression-level: 0
+          path: |
+            apps/desktop/release/*.AppImage
+            apps/desktop/release/*.deb
+
+      - name: Upload updater feeds
+        uses: actions/upload-artifact@v7
+        with:
+          name: pi-desktop-plus-linux-x64-updater
+          if-no-files-found: ignore
+          compression-level: 0
+          path: apps/desktop/release/latest*.yml
+
+  publish:
+    name: Publish GitHub Release (AppImage + deb)
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List release assets
+        run: |
+          set -euo pipefail
+          ls -la dist/
+          shopt -s nullglob
+          appimages=(dist/*.AppImage)
+          debs=(dist/*.deb)
+          if [[ "${#appimages[@]}" -ne 1 || "${#debs[@]}" -ne 1 ]]; then
+            echo "::error::Release assets must contain exactly one AppImage and one deb."
+            exit 1
+          fi
+
+      - name: Create or update the GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.build.outputs.tag }}
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(needs.build.outputs.tag, '-') }}

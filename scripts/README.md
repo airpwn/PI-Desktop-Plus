@@ -89,6 +89,12 @@ notarize, and staple macOS artifacts; `workflow_dispatch` may set
 `sign_macos: false` only for unsigned debug artifacts. See the [release
 runbook](../docs/spec/06-delivery/06-release-runbook.md).
 
+`.github/workflows/linux-release.yml` is the fork's Linux-only release lane:
+manual dispatch, `dist:linux` on Ubuntu 22.04, the glibc floor gate, and one
+AppImage plus one deb verified as `pi-desktop-plus` before a GitHub Release is
+created or updated. It exists because `release.yml` requires the Apple signing
+secrets; it stays dispatch-only so a tag push never packages Linux twice.
+
 ### Provider certificate regression
 
 - `node scripts/e2e-provider-certificates.mjs`: real desktop launcher and
