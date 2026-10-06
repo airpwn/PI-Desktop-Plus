@@ -94,6 +94,11 @@ CDP 插件工具在 Plan 中仍被拒绝）。 Bash 在 Plan 中仍然可用：�
 结构化 title/question 字段。 Renderer 和 sidecar 状态无法写入或
 替换一个工件。
 
+用户配置的 MCP 服务器提供的工具（`mcp_<serverId>_<tool>`）默认绝不视为低风险：
+host-core 将其归类为 `medium`，并忽略 MCP 服务器为自身声明的任何风险级别。
+`ask` 和 `accept-edits` 需要审批（`allow-session` 授权在该会话剩余时间内覆盖同一
+工具名，仅保存在内存中），`auto` 自动允许，Plan/Goal 仍然拒绝（D640，ADR `mcp-tool-approval-risk`）。
+
 ## 4.1 技能市场出网
 
 渲染层不拉取技能目录或 SKILL.md。Electron 主进程按公网策略发起 HTTPS 请求（ADR 0243 / D413，由 ADR 0272 / D436 修订）：仅 `https`、共享的公网主机语法检查、`redirect: "manual"`，以及按请求实际会走的线路逐跳判定。每一跳之前，客户端都会向承载 `net.fetch` 的会话询问它自己的代理判定（`Session.resolveProxy`）：`proxied` 线路上按线路判定，因此容忍解析器自身产物的那一类（`benchmark`，TUN fake-IP）；`direct` 或读不出线路时默认保留完整的本地分类，回环、RFC1918、ULA、link-local、mapped IPv6 以及其他所有非公网类别一律拒绝。显式 `allowFakeIp` 选项仅可为透明路由器/TUN 部署额外放行 benchmark 占位地址。安装只通过 `skills.create` 写入 markdown。内联相邻 markdown 后仍受 128 KiB 宿主上限约束。
@@ -173,7 +178,9 @@ MCP 市场只接受无凭据的公网 HTTPS 源和目录端点。Main 在每一�
 
 本地 MCP 控制服务是明确的自动化边界，不是通用的远程控制监听器：
 
-- 默认关闭，只有设置 `PI_DESKTOP_MCP_CONTROL=1` 才会启动。
+- 默认关闭。启动环境设置 `PI_DESKTOP_MCP_CONTROL=1`，或本机偏好文件
+  `<user-data>/mcp-control-settings.json` 保存了启用状态时才会启动。明确的
+  `PI_DESKTOP_MCP_CONTROL=0` 优先于该保存值。
 - 只绑定 `127.0.0.1`，若监听地址不是回环则拒绝启动。不存在绑定局域网或公网接口的
   配置路径，也不会重新打开被延后的远程 Gateway / WebUI 范围。
 - 校验请求中提供的 `Origin`，只允许本地回环主机名，以阻止远程网页通过 DNS
@@ -183,6 +190,10 @@ MCP 市场只接受无凭据的公网 HTTPS 源和目录端点。Main 在每一�
 - 排除密钥 get/set/delete 通道、provider/OAuth/MCP 密钥写入路径、设置写入，以及
   渲染器专属的原生选择器/对话框通道（包括 `plugin/loadDev`）。分发前剥离密钥形态
   字段。操作目录是显式的，新增加的 IPC 处理器不会自动暴露。
+- 开关通道对（`mcpControlGet`、`mcpControlSet`）仅面向渲染器：它不进入经过审查的
+  MCP 操作目录，因此外部客户端无法关闭为自己提供服务的控制面，并且其返回的状态不含
+  bearer token，也不含连接记录。偏好文件以 `0600` 权限原子写入，同样不含这两者，
+  也不会同步。
 - 调用委托给现有主进程 IPC 处理器，因此主机可用性、工作区边界、权限检查、输入
   校验和脱敏日志仍是权威边界。通用危险操作、session/configure（权限模式）和破坏性
   命名工具要求显式的 `confirm: true`。该标志是 Agent 确认，不是用户弹窗。

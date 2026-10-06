@@ -148,6 +148,20 @@ pub fn send_team_message(db: &Database, params: SendMessageParams<'_>) -> Result
     }
 
     validate_team_participant(db, team_session_id, &target_session_id)?;
+    if target_session_id != team_session_id {
+        super::review::require_approved_member(db, team_session_id, &target_session_id)?;
+    }
+    if caller_session_id != team_session_id {
+        if let Err(error) =
+            super::review::require_approved_member(db, team_session_id, caller_session_id)
+        {
+            let historical_report = target_session_id == team_session_id
+                && super::review::is_live_team_mail_turn(db, team_session_id, caller_session_id)?;
+            if !historical_report {
+                return Err(error);
+            }
+        }
+    }
     let permission_ceiling =
         validate_participant_permissions(db, caller_session_id, &target_session_id)?;
 
@@ -196,27 +210,33 @@ pub fn send_team_message(db: &Database, params: SendMessageParams<'_>) -> Result
         return Ok(existing);
     }
 
-    db.conn().execute(
-        "INSERT INTO session_collaboration_messages (
-            id, plugin_id, source_session_id, source_title, target_session_id,
-                    target_title, kind, content, status, notify_on_completion, idempotency_key,
-                    remaining_hops, permission_ceiling, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 0, ?9, 1, ?10, ?11, ?11)
-         ON CONFLICT(plugin_id, source_session_id, idempotency_key) DO NOTHING",
-        params![
-            message_id,
-            plugin_id,
-            caller_session_id,
-            source_member_name,
-            target_session_id,
-            target_member_name,
-            TEAM_MESSAGE_KIND,
-            content,
-            idem_key,
-            permission_ceiling,
-            now
-        ],
-    )?;
+    sessions::with_savepoint(db.conn(), "team_mailbox", |conn| {
+        let inserted = conn.execute(
+            "INSERT INTO session_collaboration_messages (
+                id, plugin_id, source_session_id, source_title, target_session_id,
+                        target_title, kind, content, status, notify_on_completion, idempotency_key,
+                        remaining_hops, permission_ceiling, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 0, ?9, 1, ?10, ?11, ?11)
+             ON CONFLICT(plugin_id, source_session_id, idempotency_key) DO NOTHING",
+            params![
+                message_id,
+                plugin_id,
+                caller_session_id,
+                source_member_name,
+                target_session_id,
+                target_member_name,
+                TEAM_MESSAGE_KIND,
+                content,
+                idem_key,
+                permission_ceiling,
+                now
+            ],
+        )?;
+        if inserted > 0 {
+            super::lifecycle::bump_team_revision_conn(conn, team_session_id)?;
+        }
+        Ok(())
+    })?;
 
     // A concurrent sender may have won the unique key between the read and
     // insert. Return the durable row in that case, never a fabricated ID.
@@ -395,6 +415,7 @@ pub fn ack_team_message(
          WHERE id = ?3 AND plugin_id = ?4 AND kind = ?5",
         params![result_text, now, message_id, plugin_id, TEAM_MESSAGE_KIND],
     )?;
+    super::lifecycle::bump_team_revision_conn(&tx, team_session_id)?;
     tx.commit()?;
     Ok(true)
 }

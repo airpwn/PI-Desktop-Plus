@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 
 const AUDIT_RETENTION_MS: i64 = 90 * 24 * 3600 * 1000;
 const TASK_RUNS_KEEP: i64 = 100;
@@ -10,7 +11,37 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_turns_ended_at ON turns(ended_at DESC)",
             [],
         );
+        // Session summaries and session search both ask whether a run owns a
+        // session, so the probe wants an index of the sessions that have one.
+        let _ = self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_runs_session ON task_runs(session_id)
+             WHERE session_id IS NOT NULL",
+            [],
+        );
         let tx = self.conn.unchecked_transaction()?;
+        let mut running_team_sessions: HashSet<String> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT team_session_id FROM teams
+                 WHERE team_session_id IN (
+                   SELECT session_id FROM turns WHERE status='running'
+                 )",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<HashSet<_>>>()?
+        };
+        let running_members: Vec<(String, String)> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT team_session_id, member_session_id FROM team_members
+                 WHERE phase='running' AND member_session_id IN (
+                   SELECT session_id FROM turns WHERE status='running'
+                 )",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (team_session_id, _) in &running_members {
+            running_team_sessions.insert(team_session_id.clone());
+        }
         tx.execute(
             "UPDATE turns
          SET status = 'aborted', error_code = COALESCE(error_code, 'TURN_ABORTED'),
@@ -18,6 +49,19 @@ impl Database {
          WHERE status = 'running'",
             params![now],
         )?;
+        for (_, member_session_id) in running_members {
+            tx.execute(
+                "UPDATE team_members SET phase='idle', error=NULL, updated_at=?2
+                 WHERE member_session_id=?1 AND phase='running'",
+                params![member_session_id, now],
+            )?;
+        }
+        for team_session_id in running_team_sessions {
+            tx.execute(
+                "UPDATE teams SET revision=revision+1, updated_at=?2 WHERE team_session_id=?1",
+                params![team_session_id, now],
+            )?;
+        }
         tx.execute(
             "UPDATE task_runs SET status = 'aborted', ended_at = ?1 WHERE status = 'running'",
             params![now],
@@ -114,6 +158,7 @@ impl Database {
                 )?;
             }
         }
+        crate::goal_progress::cleanup_auth_tokens_conn(&tx)?;
         tx.commit()?;
         self.conn.execute(
             "DELETE FROM audit_log WHERE ts < ?1",
@@ -142,6 +187,7 @@ impl Database {
         // One-time repair: strip the Windows extended-length path prefix
         // (`//?/X:/...` → `X:/...`) from project paths stored by older versions.
         self.fix_extended_length_project_paths()?;
+        crate::team::interrupt_pending_reviews_on_boot(self)?;
         Ok(())
     }
 
@@ -613,6 +659,18 @@ pub(crate) fn create_migration_backup(
     path: &Path,
     version: i64,
 ) -> Result<PathBuf> {
+    create_migration_backup_at(conn, path, migration_backup_path(path, version), version)
+}
+
+/// Snapshot `path` to `backup` and verify the copy carries `version`. The
+/// caller names the file so a track other than the upstream `user_version`
+/// chain (the Plus schema track) never overwrites a `v{N}.bak`.
+pub(crate) fn create_migration_backup_at(
+    conn: &Connection,
+    path: &Path,
+    backup: PathBuf,
+    version: i64,
+) -> Result<PathBuf> {
     let checkpoint: (i64, i64, i64) = conn
         .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -624,7 +682,6 @@ pub(crate) fn create_migration_backup(
         ));
     }
 
-    let backup = migration_backup_path(path, version);
     let backup_name = backup
         .file_name()
         .and_then(|name| name.to_str())
@@ -847,165 +904,77 @@ pub(crate) fn migrate_v18_to_v19(conn: &Connection, path: &Path) -> Result<()> {
     result
 }
 
-/// v20 adds `artifact_workspace_kind` to `plan_approvals` to durably distinguish
-/// between project-origin and scratch-origin contract checkpoints, and creates
-/// `goal_reports` storage for Goal completion reporting.
+/// v20 persists stable user-message identity and Live Voice provenance on
+/// queued turns so a restart cannot lose source metadata before dispatch.
 pub(crate) fn migrate_v19_to_v20_tx(tx: &rusqlite::Transaction<'_>) -> Result<()> {
-    let has_workspace_kind: bool = tx.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM pragma_table_info('plan_approvals') WHERE name = 'artifact_workspace_kind'
-         )",
+    let has_queue: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'turn_queue')",
         [],
         |row| row.get(0),
     )?;
-    if !has_workspace_kind {
-        tx.execute_batch(
-            "ALTER TABLE plan_approvals ADD COLUMN artifact_workspace_kind TEXT NOT NULL DEFAULT 'project' CHECK (artifact_workspace_kind IN ('project', 'scratch'));",
-        )?;
+    if has_queue {
+        for (column, definition) in [("user_message_id", "TEXT"), ("voice_origin_json", "TEXT")] {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turn_queue') WHERE name = ?1)",
+                [column],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                tx.execute_batch(&format!(
+                    "ALTER TABLE turn_queue ADD COLUMN {column} {definition};"
+                ))?;
+            }
+        }
     }
-    tx.execute_batch(crate::goal_reports::SCHEMA)?;
     tx.pragma_update(None, "user_version", 20i64)?;
     Ok(())
 }
 
 pub(crate) fn migrate_v19_to_v20(conn: &Connection, path: &Path) -> Result<()> {
     let backup = create_migration_backup(conn, path, 19)?;
-    conn.pragma_update(None, "foreign_keys", false)?;
-    let result = (|| {
-        let tx = conn.unchecked_transaction()?;
-        migrate_v19_to_v20_tx(&tx)?;
-        tx.commit().with_context(|| {
-            format!(
-                "commit schema v19 to v20 migration; backup {} remains",
-                backup.display()
-            )
-        })
-    })();
-    let _ = conn.pragma_update(None, "foreign_keys", true);
-    result
-}
-
-/// v21 adds execution profiles and Team tables, and completes Goal objects for
-/// databases created by either unreleased v20 branch.
-pub(crate) fn migrate_v20_to_v21_tx(tx: &rusqlite::Transaction<'_>) -> Result<()> {
-    let has_execution_profile: bool = tx.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'execution_profile'
-         )",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_execution_profile {
-        tx.execute_batch(
-            "ALTER TABLE sessions
-             ADD COLUMN execution_profile TEXT NOT NULL DEFAULT 'standard'
-             CHECK (execution_profile IN ('standard', 'team'));",
-        )?;
-    }
-
-    let has_workspace_kind: bool = tx.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM pragma_table_info('plan_approvals') WHERE name = 'artifact_workspace_kind'
-         )",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_workspace_kind {
-        tx.execute_batch(
-            "ALTER TABLE plan_approvals ADD COLUMN artifact_workspace_kind TEXT NOT NULL DEFAULT 'project' CHECK (artifact_workspace_kind IN ('project', 'scratch'));",
-        )?;
-    }
-
-    tx.execute_batch(super::schema::TEAM_SCHEMA)?;
-    tx.execute_batch(crate::goal_reports::SCHEMA)?;
-    tx.pragma_update(None, "user_version", 21i64)?;
-    Ok(())
-}
-
-pub(crate) fn migrate_v20_to_v21(conn: &Connection, path: &Path) -> Result<()> {
-    let backup = create_migration_backup(conn, path, 20)?;
-    conn.pragma_update(None, "foreign_keys", false)?;
-    let result = (|| {
-        let tx = conn.unchecked_transaction()?;
-        migrate_v20_to_v21_tx(&tx)?;
-        tx.commit().with_context(|| {
-            format!(
-                "commit schema v20 to v21 migration; backup {} remains",
-                backup.display()
-            )
-        })
-    })();
-    let _ = conn.pragma_update(None, "foreign_keys", true);
-    result
-}
-
-/// v22 binds approved execution models and stores one-time Plan/Goal schedules.
-pub(crate) fn migrate_v21_to_v22(conn: &Connection, path: &Path) -> Result<()> {
-    let backup = create_migration_backup(conn, path, 21)?;
     let tx = conn.unchecked_transaction()?;
-    for (name, definition) in [
-        ("execution_provider_id", "TEXT"),
-        ("execution_model_id", "TEXT"),
-        ("revision_intent_json", "TEXT"),
-        (
-            "revision_state",
-            "TEXT CHECK (revision_state IN ('ready', 'started', 'failed', 'submitted'))",
-        ),
-        ("revision_turn_id", "TEXT"),
-        ("revision_error_code", "TEXT"),
-    ] {
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('plan_approvals') WHERE name = ?1)",
-            params![name],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            tx.execute_batch(&format!(
-                "ALTER TABLE plan_approvals ADD COLUMN {name} {definition};"
-            ))?;
-        }
-    }
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS plan_execution_schedules (
-           proposal_id TEXT PRIMARY KEY REFERENCES plan_approvals(request_id) ON DELETE CASCADE,
-           scheduled_for INTEGER NOT NULL,
-           timezone TEXT NOT NULL,
-           state TEXT NOT NULL CHECK (state IN ('scheduled', 'missed', 'claimed', 'cancelled')),
-           updated_at INTEGER NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS idx_plan_execution_schedules_due
-           ON plan_execution_schedules(state, scheduled_for);",
-    )?;
-    tx.pragma_update(None, "user_version", 22i64)?;
+    migrate_v19_to_v20_tx(&tx)?;
     tx.commit().with_context(|| {
         format!(
-            "commit schema v21 to v22 migration; backup {} remains",
+            "commit schema v19 to v20 migration; backup {} remains",
             backup.display()
         )
     })?;
     Ok(())
 }
 
-/// v23 binds additive effective execution_kind ('plan' | 'goal') to plan_approvals.
-pub(crate) fn migrate_v22_to_v23(conn: &Connection, path: &Path) -> Result<()> {
-    let backup = create_migration_backup(conn, path, 22)?;
-    verify_migration_backup(&backup, 22)?;
-    let tx = conn.unchecked_transaction()?;
-    let exists: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('plan_approvals') WHERE name = 'execution_kind')",
+/// v21 adds the per-session Todo checklist: the `todo_revision` /
+/// `todo_updated_at` stamps on `sessions` and the ordered `session_todo`
+/// rows that the `TodoWrite` tool replaces atomically.
+///
+/// The table DDL is shared verbatim with the fresh schema, and both the
+/// column probe and `IF NOT EXISTS` keep a second run harmless: an existing
+/// test fixture that downgrades `user_version` in place already carries the
+/// table and columns.
+pub(crate) fn migrate_v20_to_v21_tx(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let has_todo_revision: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'todo_revision')",
         [],
         |row| row.get(0),
     )?;
-    if !exists {
+    if !has_todo_revision {
         tx.execute_batch(
-            "ALTER TABLE plan_approvals ADD COLUMN execution_kind TEXT CHECK (execution_kind IN ('plan', 'goal'));
-             UPDATE plan_approvals SET execution_kind = kind WHERE (execution_id IS NOT NULL OR status = 'approved') AND execution_kind IS NULL;"
+            "ALTER TABLE sessions ADD COLUMN todo_revision INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE sessions ADD COLUMN todo_updated_at INTEGER;",
         )?;
     }
-    tx.pragma_update(None, "user_version", 23i64)?;
+    tx.execute_batch(SESSION_TODO_DDL)?;
+    tx.pragma_update(None, "user_version", 21i64)?;
+    Ok(())
+}
+
+pub(crate) fn migrate_v20_to_v21(conn: &Connection, path: &Path) -> Result<()> {
+    let backup = create_migration_backup(conn, path, 20)?;
+    let tx = conn.unchecked_transaction()?;
+    migrate_v20_to_v21_tx(&tx)?;
     tx.commit().with_context(|| {
         format!(
-            "commit schema v22 to v23 migration; backup {} remains",
+            "commit schema v20 to v21 migration; backup {} remains",
             backup.display()
         )
     })?;

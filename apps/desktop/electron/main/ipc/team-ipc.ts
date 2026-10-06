@@ -38,6 +38,14 @@ export function registerTeamIpc({
       callerSessionId: input.teamSessionId,
     });
   });
+  handle(IPC.invoke.teamGetSnapshot, async (input: { teamSessionId: string }) => {
+    const host = getHost();
+    if (!host) throw new Error("host unavailable");
+    return host.call("team.getSnapshot", {
+      teamSessionId: input?.teamSessionId,
+      callerSessionId: input?.teamSessionId,
+    });
+  });
 
   handle(IPC.invoke.teamPause, async (input: { teamSessionId: string }) => {
     if (!getHost()) throw new Error("host unavailable");
@@ -54,4 +62,77 @@ export function registerTeamIpc({
     });
     return teamDelivery.resumeTeam(input.teamSessionId);
   });
+
+  handle(
+    IPC.invoke.teamGetExecutionDecision,
+    async (input: { teamSessionId: string; leadTurnId?: string }) => {
+      const host = getHost();
+      if (!host) throw new Error("host unavailable");
+      return host.call("team.getExecutionDecision", {
+        ...input,
+        callerSessionId: input.teamSessionId,
+      });
+    },
+  );
+
+  handle(
+    IPC.invoke.teamGetLaunchReview,
+    async (input: { teamSessionId: string; reviewId?: string }) => {
+      const host = getHost();
+      if (!host) throw new Error("host unavailable");
+      return host.call("team.getLaunchReview", {
+        ...input,
+        callerSessionId: input.teamSessionId,
+      });
+    },
+  );
+
+  handle(
+    IPC.invoke.teamUpdateLaunchReview,
+    async (input: {
+      teamSessionId: string;
+      reviewId: string;
+      expectedRevision: number;
+      selections: unknown[];
+    }) => {
+      const host = getHost();
+      if (!host) throw new Error("host unavailable");
+      return host.call("team.updateLaunchReview", {
+        ...input,
+        callerSessionId: input.teamSessionId,
+      });
+    },
+  );
+
+  handle(
+    IPC.invoke.teamConfirmLaunchReview,
+    async (input: {
+      teamSessionId: string;
+      reviewId: string;
+      expectedRevision: number;
+    }) => {
+      const host = getHost();
+      if (!host) throw new Error("host unavailable");
+      return host.call("team.confirmLaunchReview", {
+        ...input,
+        callerSessionId: input.teamSessionId,
+      });
+    },
+  );
+
+  handle(
+    IPC.invoke.teamCancelLaunchReview,
+    async (input: {
+      teamSessionId: string;
+      reviewId: string;
+      expectedRevision: number;
+    }) => {
+      const host = getHost();
+      if (!host) throw new Error("host unavailable");
+      return host.call("team.cancelLaunchReview", {
+        ...input,
+        callerSessionId: input.teamSessionId,
+      });
+    },
+  );
 }

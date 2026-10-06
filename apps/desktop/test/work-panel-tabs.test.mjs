@@ -6,6 +6,7 @@ const {
   activateWorkPanelTabState,
   browserPluginTab,
   closeWorkPanelTabState,
+  createWorkPanelFileRequest,
   emptyWorkPanelContext,
   fileWorkPanelTab,
   goalReportWorkPanelTab,
@@ -24,7 +25,28 @@ const {
   subagentWorkPanelTab,
   switchWorkPanelContextState,
   toolWorkPanelTab,
+  teamWorkPanelTab,
 } = await import("../src/lib/work-panel-tabs.ts");
+
+test("Team task links reuse one tab but each explicit navigation gets a fresh request", () => {
+  const first = teamWorkPanelTab("team-1", { kind: "task", taskId: "task-1" });
+  const reopened = teamWorkPanelTab("team-1", { kind: "task", taskId: "task-1" });
+  const state = openWorkPanelTabState({ tabs: [first], activeTabId: first.id }, reopened);
+  assert.equal(state.tabs.length, 1);
+  assert.deepEqual(state.tabs[0].teamTarget, { kind: "task", taskId: "task-1" });
+  assert.ok(reopened.teamNavigationSeq > first.teamNavigationSeq);
+});
+
+test("Team member links carry the real member session into detail navigation", () => {
+  const tab = teamWorkPanelTab("team-1", {
+    kind: "member",
+    memberSessionId: "member-session-1",
+  });
+  assert.deepEqual(tab.teamTarget, {
+    kind: "member",
+    memberSessionId: "member-session-1",
+  });
+});
 
 test("work panel tabs open on demand and deduplicate by resource", () => {
   const empty = { tabs: [], activeTabId: null };
@@ -48,14 +70,15 @@ test("new tabs are unique launcher pages and replace themselves with a tool", ()
     openWorkPanelTabState({ tabs: [], activeTabId: null }, first),
     second,
   );
+  const browser = browserPluginTab("https://example.com");
   const replaced = replaceWorkPanelTabState(
     state,
     second.id,
-    browserPluginTab("https://example.com"),
+    browser,
   );
 
-  assert.deepEqual(replaced.tabs.map((tab) => tab.id), [first.id, "plugin:pi.browser/browser"]);
-  assert.equal(replaced.activeTabId, "plugin:pi.browser/browser");
+  assert.deepEqual(replaced.tabs.map((tab) => tab.id), [first.id, browser.id]);
+  assert.equal(replaced.activeTabId, browser.id);
   assert.equal(replaced.tabs.find((tab) => tab.id === first.id)?.kind, "new");
 });
 
@@ -82,6 +105,22 @@ test("file tabs normalize lexical paths and remain distinct by resource", () => 
   assert.notEqual(first.id, second.id);
   assert.equal(normalizeWorkPanelFilePath("../src/../App.tsx"), "../App.tsx");
   assert.equal(normalizeWorkPanelFilePath("/repo/./src/../App.tsx"), "/repo/App.tsx");
+});
+
+test("file-view requests preserve a positioned file tab", () => {
+  const tab = fileWorkPanelTab("src/App.tsx", "text/typescript", {
+    line: 65,
+    column: 4,
+  });
+
+  assert.deepEqual(createWorkPanelFileRequest(tab, 7), {
+    path: "src/App.tsx",
+    seq: 7,
+    mimeType: "text/typescript",
+    line: 65,
+    column: 4,
+  });
+  assert.equal(createWorkPanelFileRequest(toolWorkPanelTab("review"), 8), null);
 });
 
 test("closing the active tab selects its right neighbor then its left", () => {

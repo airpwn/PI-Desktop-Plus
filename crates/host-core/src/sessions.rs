@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -12,8 +12,118 @@ use std::sync::{Mutex, OnceLock};
 use crate::transcripts::{self, CompactionRecord, MessageRecord, RevisionRecord};
 
 mod fork_files;
+mod model_system;
+mod usage;
+pub use usage::record_usage;
 
 pub const MODES: [&str; 3] = ["plan", "goal", "agent"];
+
+pub(crate) fn with_savepoint<T>(
+    conn: &Connection,
+    name: &'static str,
+    operation: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    if !matches!(
+        name,
+        "create_session"
+            | "fork_session"
+            | "team_roster"
+            | "team_selection"
+            | "team_activity"
+            | "team_mailbox"
+    ) {
+        return Err(anyhow!("invalid internal savepoint name"));
+    }
+    conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+    match operation(conn) {
+        Ok(value) => match conn.execute_batch(&format!("RELEASE SAVEPOINT {name}")) {
+            Ok(()) => Ok(value),
+            Err(error) => {
+                let rollback = conn.execute_batch(&format!(
+                    "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
+                ));
+                match rollback {
+                    Ok(()) => Err(error.into()),
+                    Err(rollback_error) => Err(anyhow!(
+                        "{error}; savepoint rollback failed: {rollback_error}"
+                    )),
+                }
+            }
+        },
+        Err(error) => {
+            if let Err(rollback_error) = conn.execute_batch(&format!(
+                "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
+            )) {
+                return Err(anyhow!(
+                    "{error}; savepoint rollback failed: {rollback_error}"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+fn fork_staging_marker(db: &Database, session_id: &str) -> Result<std::path::PathBuf> {
+    let mut path = transcripts::transcript_path(db.data_dir(), session_id)?;
+    path.set_extension("team-fork-pending");
+    Ok(path)
+}
+
+fn write_fork_staging_marker(db: &Database, session_id: &str) -> Result<()> {
+    use std::io::Write;
+    let path = fork_staging_marker(db, session_id)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let result = (|| -> Result<()> {
+        file.write_all(b"pi-team-fork-v1\n")?;
+        file.sync_data()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        drop(file);
+        if let Err(cleanup_error) = remove_fork_staging_marker(db, session_id) {
+            return Err(anyhow!("{error}; marker cleanup failed: {cleanup_error}"));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn remove_fork_staging_marker(db: &Database, session_id: &str) -> Result<()> {
+    match std::fs::remove_file(fork_staging_marker(db, session_id)?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn commit_team_fork_staging_marker(db: &Database, session_id: &str) {
+    if let Err(error) = remove_fork_staging_marker(db, session_id) {
+        tracing::warn!(%session_id, %error, "team fork staging marker cleanup failed");
+    }
+}
+
+pub(crate) fn cleanup_uncommitted_team_session_files(
+    db: &Database,
+    session_id: &str,
+) -> Result<()> {
+    invalidate_transcript_layout(session_id);
+    transcripts::remove_session_files(db.data_dir(), session_id);
+    remove_fork_staging_marker(db, session_id)?;
+    if let Some(path) = crate::scratch::session_dir(db.data_dir(), session_id) {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
 
 /// Maximum number of Unicode scalar values accepted for a user-defined title.
 pub const MAX_SESSION_TITLE_CHARS: usize = 80;
@@ -130,7 +240,7 @@ pub fn normalize_dispatch_title(raw: &str) -> Result<String> {
     Ok(collapsed)
 }
 
-fn validate_thinking_level(level: &str) -> Result<()> {
+pub(crate) fn validate_thinking_level(level: &str) -> Result<()> {
     if is_valid_thinking_level(level) {
         Ok(())
     } else {
@@ -201,8 +311,26 @@ pub struct SessionSummary {
     pub permission_mode: String,
     #[serde(default = "default_execution_profile")]
     pub execution_profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<SessionTeamRelation>,
     pub updated_at: String,
     pub created_at: String,
+    /// True when this session is the transcript owned by a scheduled-task run.
+    /// Automation transcripts are entered from the Scheduled page, so the
+    /// sidebar and session search hide them (issue #1291). The value is derived
+    /// from `task_runs.session_id` on read; no session column stores it, and
+    /// deleting the task frees its sessions back into the ordinary lists.
+    #[serde(default)]
+    pub scheduled_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTeamRelation {
+    pub team_session_id: String,
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +345,10 @@ pub struct MessageUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<i64>,
     pub total_tokens: i64,
+    /// Additive accounting provenance and atomic operation ledger. Preserve these
+    /// JSON fields verbatim, including fields introduced by a newer producer.
+    #[serde(default, flatten)]
+    pub accounting: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -230,14 +362,11 @@ pub struct MessageAttachment {
     pub mime_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SkillMention {
-    pub start: usize,
-    pub end: usize,
-    pub id: String,
+    /// Bounded excerpt of a referenced conversation (`kind: "session"`), written
+    /// by Electron main when the prompt carried a `pi-desktop://session/<id>`
+    /// link. Travels with the user message so the model keeps reading it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,14 +375,18 @@ pub struct UiMessage {
     pub id: String,
     pub role: String,
     pub content: String,
-    /// Original typed slash invocation; content contains the expanded prompt.
+    /// Original text for a slash template or Skill invocation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// Validated Skill tokens in `command`, with UTF-16 offsets for the renderer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_mentions: Option<Vec<SkillMention>>,
     /// Host-authenticated agent-to-agent origin, never a human authorization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_message: Option<Value>,
+    /// Minimal provenance for an accepted Live Voice work input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_origin: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<MessageAttachment>>,
     /// Accepted input to an existing turn, preserved by Stop after renderer reload.
@@ -309,6 +442,8 @@ pub struct UiMessage {
     /// runtime excludes them from the parent's model context.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested_parent_tool_call_id: Option<String>,
     /// Subagent definition name that produced the row.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
@@ -316,6 +451,17 @@ pub struct UiMessage {
     /// as an additive `hostedSearch` transcript block; no SQL migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosted_search: Option<Value>,
+    /// Internal model-context state, preserved outside visible message text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_system: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillMention {
+    pub start: usize,
+    pub end: usize,
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,6 +533,9 @@ fn is_default_title(title: &str) -> bool {
 /// the search index row (None for tool rows, matching the FTS triggers).
 pub(crate) fn ui_to_record(message: &UiMessage) -> (MessageRecord, Option<String>) {
     let mut meta_obj = serde_json::Map::new();
+    if let Some(system) = &message.model_system {
+        meta_obj.insert("modelSystem".into(), system.clone());
+    }
     if let Some(command) = &message.command {
         meta_obj.insert("command".into(), json!(command));
     }
@@ -395,6 +544,9 @@ pub(crate) fn ui_to_record(message: &UiMessage) -> (MessageRecord, Option<String
     }
     if let Some(origin) = &message.session_message {
         meta_obj.insert("sessionMessage".into(), origin.clone());
+    }
+    if let Some(origin) = &message.voice_origin {
+        meta_obj.insert("voiceOrigin".into(), origin.clone());
     }
     if let Some(steering) = message.steering {
         meta_obj.insert("steering".into(), json!(steering));
@@ -409,17 +561,7 @@ pub(crate) fn ui_to_record(message: &UiMessage) -> (MessageRecord, Option<String
         meta_obj.insert("providerId".into(), json!(provider_id));
     }
     if let Some(usage) = &message.usage {
-        meta_obj.insert(
-            "usage".into(),
-            json!({
-                "inputTokens": usage.input_tokens,
-                "outputTokens": usage.output_tokens,
-                "cacheReadTokens": usage.cache_read_tokens,
-                "cacheWriteTokens": usage.cache_write_tokens,
-                "reasoningTokens": usage.reasoning_tokens,
-                "totalTokens": usage.total_tokens,
-            }),
-        );
+        meta_obj.insert("usage".into(), json!(usage));
     }
     if let Some(duration) = message.response_duration_ms {
         meta_obj.insert("responseDurationMs".into(), json!(duration));
@@ -441,6 +583,9 @@ pub(crate) fn ui_to_record(message: &UiMessage) -> (MessageRecord, Option<String
     }
     if let Some(parent) = &message.parent_tool_call_id {
         meta_obj.insert("parentToolCallId".into(), json!(parent));
+    }
+    if let Some(parent) = &message.nested_parent_tool_call_id {
+        meta_obj.insert("nestedParentToolCallId".into(), json!(parent));
     }
     if let Some(agent) = &message.agent_name {
         meta_obj.insert("agentName".into(), json!(agent));
@@ -514,6 +659,9 @@ pub(crate) fn ui_to_record(message: &UiMessage) -> (MessageRecord, Option<String
                 if let Some(size) = attachment.size {
                     block.insert("size".into(), json!(size));
                 }
+                if let Some(text) = &attachment.text {
+                    block.insert("text".into(), json!(text));
+                }
                 blocks.push(Value::Object(block));
             }
         }
@@ -540,6 +688,7 @@ pub(crate) fn record_to_ui(record: MessageRecord) -> UiMessage {
         _ => Vec::new(),
     };
     let meta = record.meta.unwrap_or(Value::Null);
+    let model_system = meta.get("modelSystem").cloned();
     let command = meta
         .get("command")
         .and_then(Value::as_str)
@@ -548,6 +697,7 @@ pub(crate) fn record_to_ui(record: MessageRecord) -> UiMessage {
         .get("skillMentions")
         .and_then(|value| serde_json::from_value(value.clone()).ok());
     let session_message = meta.get("sessionMessage").cloned();
+    let voice_origin = meta.get("voiceOrigin").cloned();
     let steering = meta.get("steering").and_then(Value::as_bool);
     let status = meta
         .get("status")
@@ -575,6 +725,22 @@ pub(crate) fn record_to_ui(record: MessageRecord) -> UiMessage {
             cache_write_tokens: value.get("cacheWriteTokens").and_then(|v| v.as_i64()),
             reasoning_tokens: value.get("reasoningTokens").and_then(|v| v.as_i64()),
             total_tokens,
+            accounting: value
+                .as_object()?
+                .iter()
+                .filter(|(key, _)| {
+                    !matches!(
+                        key.as_str(),
+                        "inputTokens"
+                            | "outputTokens"
+                            | "cacheReadTokens"
+                            | "cacheWriteTokens"
+                            | "reasoningTokens"
+                            | "totalTokens"
+                    )
+                })
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
         })
     });
     let error = meta.get("error").cloned();
@@ -590,6 +756,10 @@ pub(crate) fn record_to_ui(record: MessageRecord) -> UiMessage {
         .get("parentToolCallId")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let nested_parent_tool_call_id = meta
+        .get("nestedParentToolCallId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let agent_name = meta
         .get("agentName")
         .and_then(|v| v.as_str())
@@ -629,6 +799,10 @@ pub(crate) fn record_to_ui(record: MessageRecord) -> UiMessage {
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
                 size: block.get("size").and_then(|v| v.as_i64()),
+                text: block
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
             })
         })
         .collect::<Vec<_>>();
@@ -649,9 +823,10 @@ pub(crate) fn record_to_ui(record: MessageRecord) -> UiMessage {
             id: record.id,
             role: record.role,
             content: text,
-            command,
-            skill_mentions,
+            command: command.clone(),
+            skill_mentions: skill_mentions.clone(),
             session_message,
+            voice_origin: voice_origin.clone(),
             attachments: None,
             steering,
             created_at: record.created_at,
@@ -684,8 +859,10 @@ pub(crate) fn record_to_ui(record: MessageRecord) -> UiMessage {
             tool_duration_ms: block.get("durationMs").and_then(|v| v.as_i64()),
             is_error,
             parent_tool_call_id,
+            nested_parent_tool_call_id,
             agent_name,
             hosted_search: hosted_search.clone(),
+            model_system: None,
         }
     } else {
         let content = blocks
@@ -703,6 +880,7 @@ pub(crate) fn record_to_ui(record: MessageRecord) -> UiMessage {
             command,
             skill_mentions,
             session_message,
+            voice_origin,
             attachments,
             steering,
             created_at: record.created_at,
@@ -726,8 +904,10 @@ pub(crate) fn record_to_ui(record: MessageRecord) -> UiMessage {
             tool_duration_ms: None,
             is_error,
             parent_tool_call_id,
+            nested_parent_tool_call_id,
             agent_name,
             hosted_search,
+            model_system,
         }
     }
 }
@@ -947,6 +1127,19 @@ fn clone_records_for_fork(
                 .cloned()
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
             if let Some(meta) = record.meta.as_mut().and_then(Value::as_object_mut) {
+                if let Some(system) = meta.get_mut("modelSystem").and_then(Value::as_object_mut) {
+                    for key in ["beforeMessageId", "afterMessageId"] {
+                        if let Some(new_id) = system
+                            .get(key)
+                            .and_then(Value::as_str)
+                            .and_then(|id| message_ids.get(id))
+                        {
+                            system.insert(key.into(), json!(new_id));
+                        } else {
+                            system.remove(key);
+                        }
+                    }
+                }
                 meta.remove("revisionRootId");
                 meta.remove("revisionCount");
                 meta.remove("activeRevision");
@@ -1111,6 +1304,21 @@ fn insert_recovered_session_row(
 /// JSONL transcript. Returns true when a row was inserted (D318).
 pub fn restore_orphaned_session(db: &Database, session_id: &str) -> Result<bool> {
     if session_created_at(db, session_id).is_ok() {
+        if db.conn().is_autocommit() && fork_staging_marker(db, session_id)?.exists() {
+            commit_team_fork_staging_marker(db, session_id);
+        }
+        return Ok(false);
+    }
+    let marker = fork_staging_marker(db, session_id)?;
+    if marker.exists() {
+        let marker_contents = std::fs::read_to_string(&marker)?;
+        if marker_contents.trim() != "pi-team-fork-v1" {
+            return Err(anyhow!("invalid team fork staging marker"));
+        }
+        tracing::warn!(
+            %session_id,
+            "skipping orphaned transcript from an uncommitted Team fork"
+        );
         return Ok(false);
     }
     let path = transcripts::transcript_path(db.data_dir(), session_id)?;
@@ -1235,8 +1443,14 @@ fn session_created_at(db: &Database, session_id: &str) -> Result<String> {
 const SUMMARY_SELECT: &str =
     "SELECT s.id, s.title, s.last_seq, p.path, s.model_id, s.provider_id, s.mode,
             s.thinking_level, s.permission_mode, s.execution_profile, s.updated_at, s.created_at,
-            p.name
+            p.name,
+            CASE WHEN lead.team_session_id IS NOT NULL THEN 'lead'
+                 WHEN member.team_session_id IS NOT NULL THEN 'member' END,
+            COALESCE(member.team_session_id, lead.team_session_id), member.name,
+            EXISTS (SELECT 1 FROM task_runs r WHERE r.session_id = s.id) AS scheduled_run
      FROM sessions s LEFT JOIN projects p ON p.id = s.project_id
+     LEFT JOIN teams lead ON lead.team_session_id = s.id
+     LEFT JOIN team_members member ON member.member_session_id = s.id
      WHERE s.deleted_at IS NULL";
 
 pub(crate) fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> {
@@ -1256,6 +1470,19 @@ pub(crate) fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sess
         updated_at: ms_to_ts(row.get(10)?),
         created_at: ms_to_ts(row.get(11)?),
         project_name: row.get(12)?,
+        team: row
+            .get::<_, Option<String>>(13)?
+            .map(|role| {
+                Ok::<SessionTeamRelation, rusqlite::Error>(SessionTeamRelation {
+                    role,
+                    team_session_id: row.get(14)?,
+                    member_name: row.get(15)?,
+                })
+            })
+            .transpose()?,
+        // Read by name: search and listing build their own column lists, so the
+        // alias keeps this mapper independent of any one query's column order.
+        scheduled_run: row.get("scheduled_run")?,
     })
 }
 
@@ -1378,6 +1605,21 @@ pub fn create_session_with_options(
     db: &Database,
     options: SessionCreateOptions,
 ) -> Result<SessionSummary> {
+    create_session_with_options_inner(db, options, false)
+}
+
+pub(crate) fn create_team_lead_session_with_options(
+    db: &Database,
+    options: SessionCreateOptions,
+) -> Result<SessionSummary> {
+    create_session_with_options_inner(db, options, true)
+}
+
+fn create_session_with_options_inner(
+    db: &Database,
+    options: SessionCreateOptions,
+    create_team_record: bool,
+) -> Result<SessionSummary> {
     let SessionCreateOptions {
         title,
         mode,
@@ -1444,30 +1686,38 @@ pub fn create_session_with_options(
         None => None,
     };
 
-    let tx = db.conn().unchecked_transaction()?;
-    tx.prepare_cached(
-        "INSERT INTO sessions (
-            id, title, project_id, provider_id, model_id, mode, thinking_level,
-            permission_mode, execution_profile, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
-    )?
-    .execute(params![
-        id,
-        title,
-        project_id,
-        provider_id,
-        model_id,
-        mode,
-        thinking_level,
-        permission_mode,
-        execution_profile,
-        now
-    ])?;
-    if let (Some(name), Some(path)) = (effective_name.as_deref(), canonical_path.as_deref()) {
-        tx.prepare_cached("UPDATE projects SET name = ?1 WHERE path = ?2")?
-            .execute(params![name, path])?;
-    }
-    tx.commit()?;
+    with_savepoint(db.conn(), "create_session", |conn| {
+        conn.prepare_cached(
+            "INSERT INTO sessions (
+                id, title, project_id, provider_id, model_id, mode, thinking_level,
+                permission_mode, execution_profile, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+        )?
+        .execute(params![
+            id,
+            title,
+            project_id,
+            provider_id,
+            model_id,
+            mode,
+            thinking_level,
+            permission_mode,
+            execution_profile,
+            now
+        ])?;
+        if create_team_record {
+            conn.execute(
+                "INSERT INTO teams (team_session_id, revision, paused, created_at, updated_at)
+                 VALUES (?1, 1, 0, ?2, ?2)",
+                params![id, now],
+            )?;
+        }
+        if let (Some(name), Some(path)) = (effective_name.as_deref(), canonical_path.as_deref()) {
+            conn.prepare_cached("UPDATE projects SET name = ?1 WHERE path = ?2")?
+                .execute(params![name, path])?;
+        }
+        Ok(())
+    })?;
 
     Ok(SessionSummary {
         id,
@@ -1481,8 +1731,11 @@ pub fn create_session_with_options(
         permission_mode,
         execution_profile,
         project_name: effective_name,
+        team: None,
         updated_at: ms_to_ts(now),
         created_at: ms_to_ts(now),
+        // The run row that owns this transcript is written after creation.
+        scheduled_run: false,
     })
 }
 
@@ -1820,13 +2073,25 @@ pub fn fork_session_through(
         .filter_map(|record| clone_compaction_for_fork(record, &message_ids, &tool_call_ids))
         .collect();
     let id = Uuid::new_v4().to_string();
-    let files = fork_files::preserve(
+    let staged_in_outer_transaction = !db.conn().is_autocommit();
+    if staged_in_outer_transaction {
+        write_fork_staging_marker(db, &id)?;
+    }
+    let files = match fork_files::preserve(
         db.data_dir(),
         source_id,
         &id,
         &mut records,
         &mut compactions,
-    )?;
+    ) {
+        Ok(files) => files,
+        Err(error) => {
+            if staged_in_outer_transaction {
+                remove_fork_staging_marker(db, &id)?;
+            }
+            return Err(error);
+        }
+    };
     let texts = records.iter().map(record_index_text).collect::<Vec<_>>();
     let now = now_ms();
     let created_at = ms_to_ts(now);
@@ -1844,11 +2109,13 @@ pub fn fork_session_through(
         &compactions,
     ) {
         transcripts::remove_session_files(db.data_dir(), &id);
+        if staged_in_outer_transaction {
+            remove_fork_staging_marker(db, &id)?;
+        }
         return Err(error);
     }
-    let indexed = (|| -> Result<()> {
-        let tx = db.conn().unchecked_transaction()?;
-        let inserted = tx
+    let indexed = with_savepoint(db.conn(), "fork_session", |conn| {
+        let inserted = conn
             .prepare_cached(
                 "INSERT INTO sessions (
                     id, title, project_id, provider_id, model_id, mode, thinking_level,
@@ -1863,14 +2130,16 @@ pub fn fork_session_through(
             return Err(anyhow!("session not found: {source_id}"));
         }
         for (seq, record) in records.iter().enumerate() {
-            insert_index_row(&tx, &id, seq as i64, None, record, texts[seq].as_deref())?;
+            insert_index_row(conn, &id, seq as i64, None, record, texts[seq].as_deref())?;
         }
-        tx.commit()?;
         Ok(())
-    })();
+    });
     if let Err(error) = indexed {
         invalidate_transcript_layout(&id);
         transcripts::remove_session_files(db.data_dir(), &id);
+        if staged_in_outer_transaction {
+            remove_fork_staging_marker(db, &id)?;
+        }
         return Err(error);
     }
     files.commit();
@@ -1887,8 +2156,11 @@ pub fn fork_session_through(
         permission_mode: source.summary.permission_mode,
         execution_profile: source.summary.execution_profile,
         project_name: source.summary.project_name,
+        team: None,
         updated_at: created_at.clone(),
         created_at,
+        // A fork is the user's own conversation, not the automation's transcript.
+        scheduled_run: false,
     };
     let messages = records.into_iter().map(record_to_ui).collect();
     Ok(ForkSessionResult::Created(Box::new(SessionDetail {
@@ -1963,6 +2235,16 @@ pub fn configure_session_with_profile(
     if let Some(profile) = execution_profile {
         validate_execution_profile(profile)?;
     }
+    crate::team::gate_session_configure(
+        db,
+        id,
+        &mode,
+        provider_id,
+        model_id,
+        thinking_level,
+        permission_mode,
+        execution_profile,
+    )?;
     crate::plans::gate_session_configure(
         db,
         id,
@@ -1972,10 +2254,15 @@ pub fn configure_session_with_profile(
         thinking_level,
         permission_mode,
     )?;
-    let changed = db
-        .conn()
-        .prepare_cached(
-            "UPDATE sessions
+    let changed = with_savepoint(db.conn(), "team_selection", |conn| {
+        let had_team_record: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM teams WHERE team_session_id=?1)",
+            [id],
+            |row| row.get(0),
+        )?;
+        let changed = conn
+            .prepare_cached(
+                "UPDATE sessions
              SET mode = ?2, provider_id = COALESCE(?3, provider_id),
                  model_id = COALESCE(?4, model_id),
                  thinking_level = COALESCE(?5, thinking_level),
@@ -1983,31 +2270,111 @@ pub fn configure_session_with_profile(
                  execution_profile = COALESCE(?7, execution_profile),
                  updated_at = ?8
              WHERE id = ?1",
-        )?
-        .execute(params![
-            id,
-            mode,
-            provider_id,
-            model_id,
-            thinking_level,
-            permission_mode,
-            execution_profile,
-            now_ms()
-        ])?;
+            )?
+            .execute(params![
+                id,
+                mode,
+                provider_id,
+                model_id,
+                thinking_level,
+                permission_mode,
+                execution_profile,
+                now_ms()
+            ])?;
+        if changed > 0 {
+            conn.execute(
+                "UPDATE team_members
+                 SET provider_id = (SELECT provider_id FROM sessions WHERE id = ?1),
+                     model_id = (SELECT model_id FROM sessions WHERE id = ?1),
+                     updated_at = ?2
+                 WHERE member_session_id = ?1",
+                params![id, now_ms()],
+            )?;
+            if execution_profile == Some("team") {
+                let is_member: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM team_members WHERE member_session_id=?1)",
+                    [id],
+                    |row| row.get(0),
+                )?;
+                if !is_member {
+                    let now = now_ms();
+                    conn.execute(
+                        "DELETE FROM kv WHERE ns='team-lifecycle-v1' AND key=?1",
+                        [id],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO teams (team_session_id, revision, paused, created_at, updated_at)
+                         VALUES (?1, 1, 0, ?2, ?2)
+                         ON CONFLICT(team_session_id) DO NOTHING",
+                        params![id, now],
+                    )?;
+                }
+            }
+            if execution_profile == Some("standard") && had_team_record {
+                let is_member: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM team_members WHERE member_session_id=?1)",
+                    [id],
+                    |row| row.get(0),
+                )?;
+                if !is_member {
+                    let now = now_ms();
+                    conn.execute("DELETE FROM teams WHERE team_session_id=?1", [id])?;
+                    conn.execute(
+                        "INSERT INTO kv (ns, key, value_json, updated_at)
+                         VALUES ('team-lifecycle-v1', ?1, '{\"dissolved\":true}', ?2)
+                         ON CONFLICT(ns, key) DO UPDATE SET
+                           value_json=excluded.value_json, updated_at=excluded.updated_at",
+                        params![id, now],
+                    )?;
+                }
+            }
+        }
+        Ok(changed)
+    })?;
     if changed == 0 {
         return Ok(None);
     }
     Ok(get_session(db, id)?.map(|detail| detail.summary))
 }
 
+pub(crate) fn configure_approved_team_member_selection(
+    db: &Database,
+    id: &str,
+    provider_id: &str,
+    model_id: &str,
+    thinking_level: &str,
+) -> Result<()> {
+    validate_thinking_level(thinking_level)?;
+    crate::team::review::validate_member_route(db, provider_id, model_id, thinking_level)?;
+    with_savepoint(db.conn(), "team_selection", |conn| {
+        let changed = conn.execute(
+            "UPDATE sessions
+             SET mode = 'agent', provider_id = ?2, model_id = ?3,
+                 thinking_level = ?4, execution_profile = 'team', updated_at = ?5
+             WHERE id = ?1",
+            params![id, provider_id, model_id, thinking_level, now_ms()],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("TEAM_NOT_FOUND: member session not found"));
+        }
+        conn.execute(
+            "UPDATE team_members
+             SET provider_id = ?2, model_id = ?3, updated_at = ?4
+             WHERE member_session_id = ?1",
+            params![id, provider_id, model_id, now_ms()],
+        )?;
+        Ok(())
+    })
+}
+
 pub fn delete_session(db: &Database, id: &str) -> Result<bool> {
     if crate::plans::has_live_scratch_goal(db, id)? {
         return Err(anyhow!("PLAN_CONFIGURATION_BLOCKED"));
     }
-    let n = db
-        .conn()
-        .prepare_cached("DELETE FROM sessions WHERE id = ?1")?
-        .execute(params![id])?;
+    let tx = db.conn().unchecked_transaction()?;
+    crate::goal_progress::cleanup_session_conn(&tx, id)?;
+    let n = tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+    tx.commit()?;
     if n > 0 {
         // Here rather than in the RPC handler so every deletion path (UI,
         // failed scheduled-run cleanup) also drops the transcript files.
@@ -2016,6 +2383,25 @@ pub fn delete_session(db: &Database, id: &str) -> Result<bool> {
         crate::goal_reports::remove_session_files(db.data_dir(), id);
     }
     Ok(n > 0)
+}
+
+/// Delete a session and detach its Team relationships in one database
+/// transaction. Transcript files are removed only after the commit succeeds.
+pub fn delete_session_with_team_cleanup(db: &Database, id: &str) -> Result<bool> {
+    if crate::plans::has_live_scratch_goal(db, id)? {
+        return Err(anyhow!("PLAN_CONFIGURATION_BLOCKED"));
+    }
+    let tx = db.conn().unchecked_transaction()?;
+    crate::team::lifecycle::cleanup_team_on_lead_delete_conn(&tx, id)?;
+    crate::goal_progress::cleanup_session_conn(&tx, id)?;
+    let deleted = tx.execute("DELETE FROM sessions WHERE id=?1", [id])? > 0;
+    tx.commit()?;
+    if deleted {
+        invalidate_transcript_layout(id);
+        transcripts::remove_session_files(db.data_dir(), id);
+        crate::goal_reports::remove_session_files(db.data_dir(), id);
+    }
+    Ok(deleted)
 }
 
 pub fn normalize_session_title(title: &str) -> Result<String> {
@@ -2038,6 +2424,53 @@ pub fn rename_session(db: &Database, id: &str, title: &str) -> Result<bool> {
         .prepare_cached("UPDATE sessions SET title = ?1 WHERE id = ?2")?
         .execute(params![title, id])?;
     Ok(n > 0)
+}
+
+pub fn rename_session_guarded(
+    db: &Database,
+    id: &str,
+    title: &str,
+    expected_title: &str,
+    expected_execution_id: Option<Option<&str>>,
+) -> Result<bool> {
+    let title = normalize_session_title(title)?;
+    let tx = db.conn().unchecked_transaction()?;
+    let Some(current_title) = tx
+        .query_row("SELECT title FROM sessions WHERE id=?1", [id], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?
+    else {
+        return Ok(false);
+    };
+    if current_title != expected_title {
+        return Err(anyhow!("CONFLICT: session title changed before rename"));
+    }
+    if let Some(expected) = expected_execution_id {
+        let latest: Option<String> = tx
+            .query_row(
+                "SELECT execution_id FROM plan_approvals
+                 WHERE session_id=?1 AND execution_id IS NOT NULL
+                 ORDER BY rowid DESC LIMIT 1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if latest.as_deref() != expected {
+            return Err(anyhow!(
+                "CONFLICT: approved execution changed before rename"
+            ));
+        }
+    }
+    let updated = tx.execute(
+        "UPDATE sessions SET title=?1 WHERE id=?2 AND title=?3",
+        params![title, id, expected_title],
+    )?;
+    if updated == 0 {
+        return Err(anyhow!("CONFLICT: session title changed before rename"));
+    }
+    tx.commit()?;
+    Ok(true)
 }
 
 /// Outcome of moving a session to a different project.
@@ -2097,6 +2530,7 @@ pub fn append_message(
     message: &UiMessage,
     turn_id: Option<&str>,
 ) -> Result<()> {
+    model_system::validate(message)?;
     let message = crate::session_collaboration::prepare_append(db, session_id, message, turn_id)?;
     let session_created = ensure_session_for_append(db, session_id)?;
     let (mut record, text) = ui_to_record(&message);
@@ -3653,39 +4087,94 @@ pub fn begin_turn(
     provider_id: Option<&str>,
     model_id: Option<&str>,
 ) -> Result<String> {
-    let id = Uuid::new_v4().to_string();
-    let inserted = db
+    crate::team::review::gate_team_member_turn(db, session_id, provider_id, model_id)?;
+    begin_turn_inner(db, session_id, provider_id, model_id)
+}
+
+pub(crate) fn begin_turn_for_team_mail(
+    db: &Database,
+    session_id: &str,
+    message_id: &str,
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
+) -> Result<String> {
+    let (plugin_id, kind, status, target_session_id): (String, String, String, String) = db
         .conn()
-        .prepare_cached(
-            "INSERT INTO turns (id, session_id, provider_id, model_id, started_at)
+        .query_row(
+            "SELECT plugin_id, kind, status, target_session_id
+             FROM session_collaboration_messages WHERE id = ?1",
+            params![message_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("TEAM_MAIL_NOT_FOUND: durable message not found"))?;
+    let team_session_id = plugin_id
+        .strip_prefix("team:")
+        .filter(|team_session_id| !team_session_id.is_empty())
+        .ok_or_else(|| anyhow!("TEAM_MAIL_INVALID: message is not Team-origin mail"))?;
+    if kind != "message" || status != "queued" || target_session_id != session_id {
+        return Err(anyhow!(
+            "TEAM_MAIL_INVALID: message must be queued Team mail for this session"
+        ));
+    }
+    crate::team::validate_team_participant(db, team_session_id, session_id)?;
+    if crate::team::get_team_member_by_session_id(db, session_id)?.is_some() {
+        let member = get_session(db, session_id)?
+            .ok_or_else(|| anyhow!("TEAM_NOT_FOUND: member session not found"))?;
+        if provider_id
+            .is_some_and(|provider| member.summary.provider_id.as_deref() != Some(provider))
+            || model_id.is_some_and(|model| member.summary.model_id.as_deref() != Some(model))
+        {
+            return Err(anyhow!(
+                "TEAM_APPROVAL_REQUIRED: Team mail turn route must match the member session"
+            ));
+        }
+    }
+    begin_turn_inner(db, session_id, provider_id, model_id)
+}
+
+fn begin_turn_inner(
+    db: &Database,
+    session_id: &str,
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
+) -> Result<String> {
+    let id = Uuid::new_v4().to_string();
+    with_savepoint(db.conn(), "team_activity", |conn| {
+        let inserted = conn
+            .prepare_cached(
+                "INSERT INTO turns (id, session_id, provider_id, model_id, started_at)
              SELECT ?1, ?2, ?3, ?4, ?5
              WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?2)
                AND NOT EXISTS (
                  SELECT 1 FROM turns WHERE session_id = ?2 AND status = 'running'
                )",
-        )?
-        .execute(params![id, session_id, provider_id, model_id, now_ms()])
-        .map_err(|error| {
-            let message = error.to_string();
-            if message.contains("turns.session_id")
-                || message.contains("idx_turns_one_running_session")
-            {
-                anyhow!("AGENT_BUSY")
-            } else {
-                error.into()
+            )?
+            .execute(params![id, session_id, provider_id, model_id, now_ms()])
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.contains("turns.session_id")
+                    || message.contains("idx_turns_one_running_session")
+                {
+                    anyhow!("AGENT_BUSY")
+                } else {
+                    error.into()
+                }
+            })?;
+        if inserted == 0 {
+            let session_exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                params![session_id],
+                |row| row.get(0),
+            )?;
+            if !session_exists {
+                return Err(anyhow!("session not found: {session_id}"));
             }
-        })?;
-    if inserted == 0 {
-        let session_exists: bool = db.conn().query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
-            params![session_id],
-            |row| row.get(0),
-        )?;
-        if !session_exists {
-            return Err(anyhow!("session not found: {session_id}"));
+            return Err(anyhow!("AGENT_BUSY"));
         }
-        return Err(anyhow!("AGENT_BUSY"));
-    }
+        crate::team::roster::update_member_turn_phase_conn(conn, session_id, "running", None)?;
+        Ok(())
+    })?;
     Ok(id)
 }
 
@@ -3733,6 +4222,21 @@ pub fn end_turn_settling(
         "completed" | "aborted" | "error" => status,
         _ => "completed",
     };
+    let existing_usage: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT usage_json FROM turns WHERE id = ?1",
+            params![turn_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let existing_usage = existing_usage
+        .as_deref()
+        .map(serde_json::from_str::<Value>)
+        .transpose()?;
+    let merged_usage = usage.map(|next| usage::merge_usage(existing_usage.as_ref(), next));
+    let usage = merged_usage.as_ref().or(existing_usage.as_ref());
     let input_tokens = usage
         .and_then(|u| u.get("inputTokens"))
         .and_then(|v| v.as_i64());
@@ -3762,6 +4266,34 @@ pub fn end_turn_settling(
             usage.map(|u| u.to_string()),
             turn_id,
         ])?;
+    if n > 0 {
+        let phase = match status {
+            "completed" => "completed",
+            "error" => "failed",
+            _ => "idle",
+        };
+        if let Some(session_id) = session_id.as_deref() {
+            crate::team::roster::update_member_turn_phase_conn(
+                &tx,
+                session_id,
+                phase,
+                (status == "error").then_some(error_code.unwrap_or("TURN_FAILED")),
+            )?;
+        }
+    }
+    // A replay after startup recovery may complete accounting for a terminal
+    // turn, but must never change its settled status or emit another notification.
+    if n == 0 && usage.is_some_and(|value| value.get("operations").is_some()) {
+        tx.execute(
+            "UPDATE turns SET input_tokens = ?1, output_tokens = ?2, usage_json = ?3 WHERE id = ?4",
+            params![
+                input_tokens,
+                output_tokens,
+                usage.map(Value::to_string),
+                turn_id
+            ],
+        )?;
+    }
     let notification = if n > 0 && create_notification {
         notifications::insert_for_terminal_turn(&tx, turn_id, status, error_code)?
     } else {
@@ -4141,6 +4673,7 @@ mod tests {
             command: None,
             skill_mentions: None,
             attachments: None,
+            voice_origin: None,
             steering: None,
             created_at: ts.into(),
             thinking: None,
@@ -4163,8 +4696,10 @@ mod tests {
             tool_duration_ms: None,
             is_error: None,
             parent_tool_call_id: None,
+            nested_parent_tool_call_id: None,
             agent_name: None,
             hosted_search: None,
+            model_system: None,
             session_message: None,
         }
     }
@@ -4710,6 +5245,235 @@ mod tests {
     }
 
     #[test]
+    fn guarded_rename_compares_title_and_approved_plan_execution() {
+        let db = test_db();
+        let session = create_session(&db, Some("Original".into()), None, None, None, None).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO kv (ns,key,value_json,updated_at) VALUES ('team-execution-decision-v1',?1,'\"team-turn\"',?2)",
+                params![format!("{}:latest", session.id), now_ms()],
+            )
+            .unwrap();
+
+        assert!(
+            rename_session_guarded(&db, &session.id, "Lead task", "Original", Some(None),).unwrap()
+        );
+
+        let now = now_ms();
+        db.conn()
+            .execute(
+                "INSERT INTO plan_approvals (
+                    request_id, session_id, turn_id, tool_call_id, plan_json, status,
+                    created_at, updated_at, resolved_at, execution_id, execution_state
+                 ) VALUES ('request-a',?1,'turn-a','tool-a','{}','approved',?2,?2,?2,'execution-a','running')",
+                params![session.id, now],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO plan_approvals (
+                    request_id, session_id, turn_id, tool_call_id, plan_json, status,
+                    created_at, updated_at, resolved_at, execution_id, execution_state
+                 ) VALUES ('request-b',?1,'turn-b','tool-b','{}','approved',?2,?2,?2,'execution-b','running')",
+                params![session.id, now + 1],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE plan_approvals SET updated_at=?1 WHERE request_id='request-a'",
+                [now + 10_000],
+            )
+            .unwrap();
+        assert!(rename_session_guarded(
+            &db,
+            &session.id,
+            "Approved title",
+            "Lead task",
+            Some(Some("execution-b")),
+        )
+        .unwrap());
+        assert!(rename_session_guarded(
+            &db,
+            &session.id,
+            "Stale title",
+            "Approved title",
+            Some(Some("execution-a")),
+        )
+        .is_err());
+        assert!(rename_session_guarded(
+            &db,
+            &session.id,
+            "Stale title",
+            "manual title",
+            Some(Some("execution-b")),
+        )
+        .is_err());
+        assert_eq!(
+            get_session(&db, &session.id)
+                .unwrap()
+                .unwrap()
+                .summary
+                .title,
+            "Approved title"
+        );
+    }
+
+    #[test]
+    fn team_turn_phase_tracks_real_turns_and_ignores_stale_settlements() {
+        let db = test_db();
+        let lead = create_session_with_options(
+            &db,
+            SessionCreateOptions {
+                title: Some("Activity lead".into()),
+                execution_profile: Some("team".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::team::ensure_team(&db, &lead.id).unwrap();
+        let member = create_session_with_options(
+            &db,
+            SessionCreateOptions {
+                title: Some("teammember-special-search".into()),
+                execution_profile: Some("team".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO team_members (
+                    team_session_id, member_session_id, name, context_kind, phase,
+                    created_at, updated_at
+                 ) VALUES (?1,?2,'worker','fresh','idle',?3,?3)",
+                params![lead.id, member.id, now_ms()],
+            )
+            .unwrap();
+
+        let lead_summary = list_sessions(&db)
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == lead.id)
+            .unwrap();
+        assert_eq!(lead_summary.team.as_ref().unwrap().role, "lead");
+        let member_summary = list_sessions(&db)
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == member.id)
+            .unwrap();
+        assert_eq!(member_summary.team.as_ref().unwrap().role, "member");
+        assert_eq!(
+            member_summary.team.as_ref().unwrap().team_session_id,
+            lead.id
+        );
+        assert_eq!(
+            member_summary.team.as_ref().unwrap().member_name.as_deref(),
+            Some("worker")
+        );
+        let search = crate::session_search::search(&db, "teammember-special", 0).unwrap();
+        let search_member = search
+            .hits
+            .iter()
+            .find(|hit| hit.session.id == member.id)
+            .unwrap();
+        assert_eq!(search_member.session.team.as_ref().unwrap().role, "member");
+
+        let first = begin_turn_inner(&db, &member.id, None, None).unwrap();
+        assert_eq!(
+            crate::team::get_team_member_by_session_id(&db, &member.id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            "running"
+        );
+        assert!(
+            end_turn(&db, &first, "completed", None, None, false)
+                .unwrap()
+                .updated
+        );
+        assert_eq!(
+            crate::team::get_team_member_by_session_id(&db, &member.id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            "completed"
+        );
+
+        let second = begin_turn_inner(&db, &member.id, None, None).unwrap();
+        let before_duplicate = crate::team::get_team(&db, &lead.id)
+            .unwrap()
+            .unwrap()
+            .revision;
+        assert!(
+            !end_turn(&db, &first, "error", Some("late"), None, false)
+                .unwrap()
+                .updated
+        );
+        assert_eq!(
+            crate::team::get_team_member_by_session_id(&db, &member.id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            "running"
+        );
+        assert_eq!(
+            crate::team::get_team(&db, &lead.id)
+                .unwrap()
+                .unwrap()
+                .revision,
+            before_duplicate
+        );
+        assert!(
+            end_turn(&db, &second, "aborted", None, None, false)
+                .unwrap()
+                .updated
+        );
+        assert_eq!(
+            crate::team::get_team_member_by_session_id(&db, &member.id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            "idle"
+        );
+
+        let third = begin_turn_inner(&db, &member.id, None, None).unwrap();
+        assert!(
+            end_turn(&db, &third, "error", Some("PROVIDER_FAILED"), None, false)
+                .unwrap()
+                .updated
+        );
+        assert_eq!(
+            crate::team::get_team_member_by_session_id(&db, &member.id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            "failed"
+        );
+        let fourth = begin_turn_inner(&db, &member.id, None, None).unwrap();
+        let untrusted_error_code = format!("TOKEN_{}", "x".repeat(80));
+        assert!(
+            end_turn(
+                &db,
+                &fourth,
+                "error",
+                Some(&untrusted_error_code),
+                None,
+                false,
+            )
+            .unwrap()
+            .updated
+        );
+        assert_eq!(
+            crate::team::get_team_member_by_session_id(&db, &member.id)
+                .unwrap()
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("TURN_FAILED")
+        );
+    }
+
+    #[test]
     fn create_session_returns_canonical_project_path() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
@@ -4947,6 +5711,9 @@ mod tests {
             permission_mode: "inherit".into(),
             execution_profile: "standard".into(),
             project_name: None,
+            team: None,
+            // Ownership is derived from `task_runs`, so an import is never one.
+            scheduled_run: false,
             created_at: "2025-01-01T00:00:00Z".into(),
             updated_at: "2025-01-02T00:00:00Z".into(),
         };
@@ -4999,6 +5766,9 @@ mod tests {
             permission_mode: "inherit".into(),
             execution_profile: "standard".into(),
             project_name: None,
+            team: None,
+            // Ownership is derived from `task_runs`, so an import is never one.
+            scheduled_run: false,
             created_at: "2025-01-01T00:00:00Z".into(),
             updated_at: "2025-01-01T00:00:00Z".into(),
         };
@@ -5083,6 +5853,7 @@ mod tests {
             command: None,
             skill_mentions: None,
             attachments: None,
+            voice_origin: None,
             steering: None,
             created_at: "2025-05-01T00:00:02Z".into(),
             thinking: None,
@@ -5105,8 +5876,10 @@ mod tests {
             tool_duration_ms: Some(1_000),
             is_error: None,
             parent_tool_call_id: None,
+            nested_parent_tool_call_id: None,
             agent_name: None,
             hosted_search: None,
+            model_system: None,
             session_message: None,
         };
         append_message(&db, &session.id, &tool, None).unwrap();
@@ -5282,6 +6055,7 @@ mod tests {
             reference: "attachments/abc123".into(),
             mime_type: Some("image/png".into()),
             size: Some(42),
+            text: None,
         }]);
 
         append_message(&db, &session.id, &user, None).unwrap();
@@ -5504,6 +6278,79 @@ mod tests {
     }
 
     #[test]
+    fn nested_lineage_roundtrips_independently_of_legacy_task_parent() {
+        let db = test_db();
+        let session = create_session(&db, None, None, None, None, None).unwrap();
+        for (id, task, nested) in [
+            ("legacy", Some("task-1"), None),
+            ("nested-root", None, Some("code-root")),
+            ("nested-delegate", Some("task-1"), Some("code-child")),
+        ] {
+            let mut message = user_msg(id, "result", "2026-09-30T00:00:00Z");
+            message.role = "assistant".into();
+            message.parent_tool_call_id = task.map(str::to_owned);
+            message.nested_parent_tool_call_id = nested.map(str::to_owned);
+            append_message(&db, &session.id, &message, None).unwrap();
+        }
+        let detail = get_session(&db, &session.id).unwrap().unwrap();
+        assert_eq!(
+            detail.messages[0].parent_tool_call_id.as_deref(),
+            Some("task-1")
+        );
+        assert_eq!(detail.messages[0].nested_parent_tool_call_id, None);
+        assert_eq!(detail.messages[1].parent_tool_call_id, None);
+        assert_eq!(
+            detail.messages[1].nested_parent_tool_call_id.as_deref(),
+            Some("code-root")
+        );
+        assert_eq!(
+            detail.messages[2].parent_tool_call_id.as_deref(),
+            Some("task-1")
+        );
+        assert_eq!(
+            detail.messages[2].nested_parent_tool_call_id.as_deref(),
+            Some("code-child")
+        );
+    }
+
+    #[test]
+    fn usage_accounting_roundtrips_without_rewriting_legacy_tokens() {
+        let db = test_db();
+        let session = create_session(&db, None, None, None, None, None).unwrap();
+        let fixtures = [
+            json!({"inputTokens": 12, "outputTokens": 3, "totalTokens": 15}),
+            json!({
+                "inputTokens": 12, "outputTokens": 3, "totalTokens": 15,
+                "operationId": "request-1", "usageOrigin": "pi",
+                "providerId": "physical-account", "modelId": "physical-model",
+                "costStatus": "reported", "aggregation": "operation",
+                "cost": {"input": 0.12, "output": 0.03, "cacheRead": 0, "cacheWrite": 0, "total": 0.15}
+            }),
+            json!({
+                "inputTokens": 12, "outputTokens": 3, "totalTokens": 15,
+                "costStatus": "unknown", "aggregation": "aggregate",
+                "operations": [
+                    {"operationId": "child-1", "usageOrigin": "pi", "inputTokens": 10, "outputTokens": 2, "totalTokens": 12, "costStatus": "unknown"},
+                    {"operationId": "classifier-1", "usageOrigin": "pi", "inputTokens": 2, "outputTokens": 1, "totalTokens": 3, "costStatus": "estimated", "cost": {"input": 0.2, "output": 0.1, "cacheRead": 0, "cacheWrite": 0, "total": 0.3}}
+                ]
+            }),
+        ];
+        for (index, usage) in fixtures.iter().enumerate() {
+            let mut message = user_msg(&format!("usage-{index}"), "answer", "2026-09-30T00:00:00Z");
+            message.role = "assistant".into();
+            message.usage = Some(serde_json::from_value(usage.clone()).unwrap());
+            append_message(&db, &session.id, &message, None).unwrap();
+            // Replayed message_end replaces a row; it must not duplicate usage.
+            append_message(&db, &session.id, &message, None).unwrap();
+        }
+        let detail = get_session(&db, &session.id).unwrap().unwrap();
+        assert_eq!(detail.messages.len(), fixtures.len());
+        for (message, expected) in detail.messages.iter().zip(fixtures) {
+            assert_eq!(json!(message.usage), expected);
+        }
+    }
+
+    #[test]
     fn assistant_thinking_roundtrips_as_canonical_blocks() {
         let db = test_db();
         let session = create_session(&db, None, None, None, None, None).unwrap();
@@ -5514,6 +6361,7 @@ mod tests {
             command: None,
             skill_mentions: None,
             attachments: None,
+            voice_origin: None,
             steering: None,
             created_at: "2025-05-01T00:00:01Z".into(),
             thinking: Some("first plan\nsecond plan".into()),
@@ -5527,6 +6375,7 @@ mod tests {
                 cache_write_tokens: None,
                 reasoning_tokens: Some(5),
                 total_tokens: 48,
+                accounting: serde_json::Map::new(),
             }),
             response_duration_ms: Some(2_000),
             response_output_tokens: Some(34),
@@ -5543,8 +6392,10 @@ mod tests {
             tool_duration_ms: None,
             is_error: None,
             parent_tool_call_id: None,
+            nested_parent_tool_call_id: None,
             agent_name: None,
             hosted_search: None,
+            model_system: None,
             session_message: None,
         };
         append_message(&db, &session.id, &assistant, None).unwrap();
@@ -5599,6 +6450,7 @@ mod tests {
             command: None,
             skill_mentions: None,
             attachments: None,
+            voice_origin: None,
             steering: None,
             created_at: "2025-05-01T00:00:01Z".into(),
             thinking: None,
@@ -5621,7 +6473,9 @@ mod tests {
             tool_duration_ms: None,
             is_error: None,
             parent_tool_call_id: None,
+            nested_parent_tool_call_id: None,
             agent_name: None,
+            model_system: None,
             hosted_search: Some(json!({
                 "status": "completed",
                 "rounds": [
@@ -5746,6 +6600,9 @@ mod tests {
             permission_mode: "inherit".into(),
             execution_profile: "standard".into(),
             project_name: None,
+            team: None,
+            // Ownership is derived from `task_runs`, so an import is never one.
+            scheduled_run: false,
             created_at: "2025-01-01T00:00:00Z".into(),
             updated_at: "2025-01-01T00:00:00Z".into(),
         };
@@ -6039,7 +6896,7 @@ mod tests {
             panic!("expected child")
         };
         let child_scratch = crate::scratch::session_dir(db.data_dir(), &child.summary.id).unwrap();
-        let child_file = child_scratch.join("pasted/first note.txt");
+        let child_file = child_scratch.join("pasted").join("first note.txt");
         assert_eq!(
             std::fs::read_to_string(&child_file).unwrap(),
             "original reference bytes"
@@ -6075,7 +6932,8 @@ mod tests {
         };
         let grandchild_file = crate::scratch::session_dir(db.data_dir(), &grandchild.summary.id)
             .unwrap()
-            .join("pasted/first note.txt");
+            .join("pasted")
+            .join("first note.txt");
         assert_eq!(
             std::fs::read_to_string(&grandchild_file).unwrap(),
             "original reference bytes"

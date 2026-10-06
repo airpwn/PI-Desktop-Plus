@@ -1,4 +1,4 @@
-import { memo, type MouseEvent as ReactMouseEvent } from "react";
+import { memo, useMemo, type MouseEvent as ReactMouseEvent } from "react";
 import { useTranslation } from "react-i18next";
 import type { PlanProposal, PlanningState, UiMessage } from "@pi-desktop/shared";
 import { proposalKindForMode } from "@pi-desktop/shared";
@@ -9,6 +9,7 @@ import { TurnOutcomeCard } from "../../../components/TurnOutcomeCard";
 import { GoalReportCard } from "../../../components/GoalReportCard";
 import { PlanApprovalBar } from "../../../components/PlanApprovalBar";
 import { goalReportWorkPanelTab } from "../../../lib/work-panel-tabs";
+import { shouldPresentGoalReportInTranscript } from "../../../lib/goal-report-presentation";
 import { IconArrowDown } from "../../../components/icons";
 import { useAppStore } from "../../../stores/app-store";
 import type { PendingPermission } from "../../../lib/pending-permissions";
@@ -33,6 +34,8 @@ import {
 } from "./TranscriptMenu";
 import { conversationMenuItems } from "./menu-items";
 import { ThinkingDisplayControl } from "./ThinkingDisplayControl";
+import { buildTeamDispatchIndex, TeamDispatchContext } from "../../../lib/team-dispatch";
+import { SlotSessionProvider } from "../../../plugins/renderer-slots/use-slots";
 
 const EMPTY_PLAN_PROPOSALS: PlanProposal[] = [];
 
@@ -151,6 +154,11 @@ function TranscriptBody({
   const compactions = useAppStore((state) =>
     sessionId ? state.sessionCompactions[sessionId] : undefined,
   );
+  const teamDispatchIndex = useMemo(
+    () => buildTeamDispatchIndex(messages, sessionId),
+    [messages, sessionId],
+  );
+
   const {
     scrollRef,
     wrapRef,
@@ -167,6 +175,7 @@ function TranscriptBody({
     veilPhase,
     handleScroll,
     revealEarlierHistory,
+    releaseFollow,
     jumpToLatest,
     disclosureAnchorNotifier,
   } = useTranscriptScroll({
@@ -256,6 +265,8 @@ function TranscriptBody({
   return (
     <TranscriptSearchContext.Provider value={searchTarget}>
     <DisclosureAnchorContext.Provider value={disclosureAnchorNotifier}>
+    <TeamDispatchContext.Provider value={teamDispatchIndex}>
+    <SlotSessionProvider sessionId={sessionId ?? ""}>
     <div
       className="thread-wrap"
       ref={wrapRef}
@@ -290,6 +301,7 @@ function TranscriptBody({
           hasEarlier={hasEarlierHistory}
           loadingEarlier={loadingOlder}
           onRevealEarlier={revealEarlierHistory}
+          onReleaseFollow={releaseFollow}
         />
       ) : null}
       <div
@@ -345,7 +357,7 @@ function TranscriptBody({
               {recentOrphanedProposals.map((proposal) => (
                 <PlanApprovalBar key={proposal.id} proposal={proposal} />
               ))}
-              {goalReports?.map((report) => (
+              {goalReports?.filter(shouldPresentGoalReportInTranscript).map((report) => (
                 <GoalReportCard
                   key={report.reportId}
                   report={report}
@@ -428,6 +440,8 @@ function TranscriptBody({
         </TooltipButton>
       ) : null}
     </div>
+    </SlotSessionProvider>
+    </TeamDispatchContext.Provider>
     </DisclosureAnchorContext.Provider>
     </TranscriptSearchContext.Provider>
   );

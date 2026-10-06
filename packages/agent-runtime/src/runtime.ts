@@ -1,7 +1,13 @@
+import { TOOL_ACTIVATION_SECTION, toolDeclarationPolicy, toolActivationSection, restoredToolActivation, syncToolActivation, type ToolDeclarationPolicy } from "./fixed-tool-declarations.js";
+import { orderSystemRows, SystemTranscriptJournal } from "./system-transcript-journal.js";
+import { planWorkspaceRequiredResult } from "./plan-workspace-error.js";
+import { accountModelStream } from "./request-usage.js";
+import { modeToolDenial, retainModeToolDeclaration, withModeExecutionGuard } from "./mode-tool-access.js";
 import { restoreHostedSearchReplay } from "./hosted-search-replay.js";
 import { requestExtensionUi } from "./extensions/ui-request.js";
 import { readLocalRequestErrorDetails } from "./local-request-errors.js";
 import { imageGenerationDescription, imageGenerationParameters } from "./image-generation/tool.js";
+import { todoWriteDescription, todoWriteParameters } from "./todo-tool.js";
 import { scheduledToolParameters, scheduledToolDescriptions } from "./scheduled-tools.js";
 import { withPiFileOpToolNames } from "./pi-file-ops.js";
 import {
@@ -9,6 +15,10 @@ import {
   persistGoalReportFailure,
   SUBMIT_GOAL_REPORT_TOOL_NAME,
 } from "./goal-report-tool.js";
+import {
+  GoalProgressManager,
+  UPDATE_GOAL_PROGRESS_TOOL_NAME,
+} from "./goal-progress-tool.js";
 import { randomUUID } from "node:crypto";
 import {
   settledDelegationMessage,
@@ -16,13 +26,6 @@ import {
 } from "./delegation-message.js";
 import {
   Agent,
-  BACKGROUND_CONTEXT,
-  compact,
-  convertToLlm,
-  estimateContextTokens,
-  estimateTokens,
-  prepareCompaction,
-  withAbortSignal,
   type AgentContext,
   type AgentEvent,
   type AgentLoopTurnUpdate,
@@ -31,17 +34,13 @@ import {
   type AgentToolResult,
   type AfterToolCallContext,
   type AfterToolCallResult,
-  type CompactionPreparation,
-  type CompactionEntry,
-  type CompactionSettings,
   type BeforeToolCallContext,
   type BeforeToolCallResult,
-  type Entry,
-  type MessageEntry,
   type PrepareNextTurnContext,
 } from "@earendil-works/pi-agent-core";
 import {
   isContextOverflow,
+  getCurrentTools,
   Type,
   type Api,
   type AssistantMessage,
@@ -56,15 +55,16 @@ import {
 import {
   DEFAULT_COMMAND_TIMEOUT_MS,
   OAUTH_AUTH_KIND,
+  validateGoalProgressSnapshot,
   type TrustedExtensionCommand,
   type TrustedExtensionDiagnostic,
   type TrustedExtensionSpec,
   type TrustedExtensionUiResponse,
 } from "@pi-desktop/shared";
-import {
+import type {
   TrustedExtensionRunner,
-  type RegisteredTrustedExtensionAgent,
-  type TrustedExtensionBridge,
+  RegisteredTrustedExtensionAgent,
+  TrustedExtensionBridge,
 } from "./extensions/runner.js";
 import type {
   AgentActivity,
@@ -104,12 +104,14 @@ import {
   contextCompactionMark,
   cumulativeDelta,
   DEFAULT_SUBAGENT_PERMISSION,
+  askToolOptionLabel,
   formatAskToolOutput,
   formatSessionMessage,
   hostedSearchFromMessage,
   isCommandShellOption,
   isToolsOutputParams,
   MAX_SUBAGENT_CONCURRENCY,
+  normalizeAskToolOption,
   normalizeSubagentName,
   proposalKindForMode,
   resolveSubagentToolNames,
@@ -118,6 +120,7 @@ import {
   type ExecutionProfile,
   normalizeExecutionProfile,
   isTeamTool,
+  DECLARE_TEAM_STRATEGY_TOOL_NAME,
   type ProposalKind,
   type SubagentPermission,
 } from "@pi-desktop/shared";
@@ -138,11 +141,29 @@ import {
 import { withExplicitRequired } from "./tool-schema.js";
 import { createTeamTools, teamSystemPrompt } from "./team/index.js";
 import { buildSessionContext } from "./session-context.js";
+import { entriesFromExecutionStart } from "./approved-execution-context.js";
+import { prepareCompaction } from "./pi-runtime-compaction-plan.js";
+import { compact } from "./pi-runtime-compaction-summary.js";
+import {
+  estimateContextTokens,
+  estimateTokens,
+} from "./pi-runtime-estimates.js";
+import { convertToLlm } from "./pi-runtime-messages.js";
+import type {
+  CompactionEntry,
+  CompactionPreparation,
+  CompactionSettings,
+  Entry,
+  MessageEntry,
+} from "./pi-runtime-types.js";
 import {
   initialSystemTranscript,
+  CONTEXT_BUDGET_SECTION,
+  syncSystemSections,
+  systemTranscriptCheckpoint,
+  removeTrailingAssistantMessages,
   rebuildSystemTranscript,
   replaceSystemPrompt,
-  syncSystemTools,
   systemPromptContent,
 } from "./system-transcript.js";
 import {
@@ -155,8 +176,8 @@ import {
   copilotRequestHeaders,
   createExtensionAgentModels,
   createProviderModels,
-  providerAllowsCustomFetch,
   DEFAULT_CONTEXT_WINDOW,
+  providerRequestFetch,
   providerRequestKey,
   type RuntimeProviderConfig,
 } from "./provider-binding.js";
@@ -209,6 +230,7 @@ import type { CustomSystemPrompt } from "./custom-system-prompt.js";
 import { projectMemoryPrompt } from "./project-memory-prompt.js";
 import {
   pluginSkillsPrompt,
+  pluginSkillsPromptSections,
   SKILL_TOOL_NAME,
   type PluginSkillDef,
 } from "./plugin-skills-prompt.js";
@@ -218,6 +240,7 @@ import {
   withOpenCodeSessionHeaders,
 } from "./opencode-session-headers.js";
 import { withCompactionRequestHeaders } from "./compaction-request.js";
+import type { CompactionRequestShape } from "./compaction-diagnostics.js";
 import {
   addSummaryUsage,
   compactionSummaryInputLimit,
@@ -269,9 +292,16 @@ import {
 
 export type { RuntimeProviderConfig } from "./provider-binding.js";
 
-export type RuntimePromptAttachment = AgentPromptAttachment & {
+export type RuntimePromptAttachment = Omit<AgentPromptAttachment, "kind"> & {
+  /**
+   * `session` is written by Electron main for a resolved
+   * `pi-desktop://session/<id>` reference; the renderer never sends it.
+   */
+  kind: AgentPromptAttachment["kind"] | "session";
   /** Base64 payload is transient and only crosses the sidecar for this turn. */
   data?: string;
+  /** Bounded excerpt of a referenced conversation (`kind: "session"`). */
+  text?: string;
 };
 
 export type RuntimePrompt = {
@@ -280,9 +310,24 @@ export type RuntimePrompt = {
   attachments?: RuntimePromptAttachment[];
 };
 
+/**
+ * The user's own words plus one quoted block per referenced conversation. The
+ * visible prompt is never rewritten: references are additive, and the model
+ * must receive this text — a reference accounted for by compaction but absent
+ * from the provider request would be context the user never got.
+ */
+function promptText(input: RuntimePrompt): string {
+  const references = (input.attachments ?? [])
+    .map((attachment) => sessionReferenceBlock(attachment))
+    .filter((block): block is string => block !== null);
+  return references.length
+    ? `${input.text}\n\n${references.join("\n\n")}`.trim()
+    : input.text;
+}
+
 function promptContent(input: string | RuntimePrompt): UserMessage["content"] {
   if (typeof input === "string") return input;
-  const text = input.text;
+  const text = promptText(input);
   const images = (input.attachments ?? []).filter(
     (attachment) =>
       attachment.kind === "image" &&
@@ -325,8 +370,30 @@ function runtimeAttachmentFromMessage(
     kind: attachment.kind,
     ...(attachment.mimeType ? { mimeType: attachment.mimeType } : {}),
     ...(attachment.size !== undefined ? { size: attachment.size } : {}),
+    ...(attachment.text ? { text: attachment.text } : {}),
     ...(data ? { data } : {}),
   };
+}
+
+/** Attribute-safe text: a session title may contain quotes or angle brackets. */
+function escapeAttribute(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+/**
+ * A referenced conversation travels with the user's message as one delimited
+ * block: it is quoted context, not the user's own words (a session link in the
+ * draft produced it), so the model reads it as reference material.
+ */
+export function sessionReferenceBlock(attachment: RuntimePromptAttachment): string | null {
+  const text = attachment.text?.trim();
+  if (!text) return null;
+  const title = escapeAttribute(attachment.name || attachment.path);
+  return `<session_reference name="${title}" session="${escapeAttribute(attachment.path)}">\n${text}\n</session_reference>`;
 }
 
 // pi-ai's adapter retry is disabled here so setup and mid-stream 429s share
@@ -529,6 +596,9 @@ function delegationSummary(record: DelegationRecord): Record<string, unknown> {
     ...(record.result?.contextDegraded
       ? { contextDegraded: record.result.contextDegraded }
       : {}),
+    ...(record.result?.scratchReportPath
+      ? { scratchReportPath: record.result.scratchReportPath }
+      : {}),
     ...(record.resumedFrom ? { resumedFrom: record.resumedFrom } : {}),
     ...(record.modelChangedFrom
       ? { modelChangedFrom: record.modelChangedFrom }
@@ -681,6 +751,8 @@ const PATH_MUTATING_TOOLS = new Set(["Write", "Edit"]);
 const CHAT_CORE_TOOL_NAMES = new Set(["Read", "Glob", "Grep", ASK_TOOL_NAME]);
 const AGENT_CORE_TOOL_NAMES = new Set([
   "Read",
+  "Glob",
+  "Grep",
   "Write",
   "Edit",
   "Bash",
@@ -950,6 +1022,8 @@ export type AgentRuntimeOptions = {
    * a second containment root. */
   scratchDir?: string;
   onEvent: (envelope: AgentEventEnvelope) => void;
+  /** Bounded diagnostics routed to the Electron logger, never the transcript. */
+  onDiagnostic?: (diagnostic: AgentRuntimeDiagnostic) => void;
   /**
    * Subagent definitions this session may delegate to (ADR 0062), already
    * merged and capped by Electron main. Empty means no `Task` tool at all.
@@ -972,6 +1046,14 @@ export type AgentRuntimeOptions = {
     memberName?: string;
     abortActiveTurn?: (memberSessionId: string) => Promise<boolean>;
   };
+};
+
+export type AgentRuntimeDiagnostic = {
+  kind: "compaction_failure" | "compaction_shape";
+  sessionId: string;
+  turnId?: string;
+  requestId: string;
+  data: Record<string, unknown>;
 };
 
 export type RuntimeMatchConfig = {
@@ -1231,13 +1313,26 @@ function shellSyntaxGuidance(shell: CommandShellOption): string {
   }
 }
 
+export function formatScratchDirForShell(
+  shell: CommandShellOption,
+  scratchDir?: string,
+): string | undefined {
+  if (!scratchDir) return undefined;
+  if (shell.dialect === "posix") {
+    // POSIX shells (including Git Bash on Windows) require forward slashes.
+    return scratchDir.replaceAll("\\", "/");
+  }
+  return scratchDir;
+}
+
 export function commandShellGuidance(
   shell: CommandShellOption,
   scratchDir?: string,
 ): string {
   const scratchVariable = shellScratchVariable(shell);
-  const scratch = scratchDir
-    ? `The session scratch directory is \`${scratchDir}\`; use ${scratchVariable} for it and keep temporary files there.`
+  const formattedScratch = formatScratchDirForShell(shell, scratchDir);
+  const scratch = formattedScratch
+    ? `The session scratch directory is \`${formattedScratch}\`; use ${scratchVariable} for it and keep temporary files there.`
     : `When PI_SCRATCH_DIR is available, use ${scratchVariable} for the session scratch directory and keep temporary files there.`;
   return [
     `Shell commands run through ${shell.label} (${shell.id}). The protocol tool remains named Bash for compatibility, even when the active shell is PowerShell or cmd.`,
@@ -1250,13 +1345,14 @@ function commandShellToolDescription(
   shell: CommandShellOption,
   scratchDir?: string,
 ): string {
+  const formattedScratch = formatScratchDirForShell(shell, scratchDir);
   return [
     `Run a non-interactive command through ${shell.label} in the workspace root.`,
     "The protocol tool remains named Bash for compatibility; write commands for the active shell dialect.",
     shellSyntaxGuidance(shell),
     `The session scratch directory variable is ${shellScratchVariable(shell)}.`,
     `An optional timeout from 1 to ${MAX_COMMAND_TIMEOUT_SECONDS} seconds may be supplied; without it, the command defaults to a 60-second timeout.`,
-    ...(scratchDir ? [`The session scratch directory is ${scratchDir}.`] : []),
+    ...(formattedScratch ? [`The session scratch directory is ${formattedScratch}.`] : []),
   ].join(" ");
 }
 
@@ -1452,16 +1548,12 @@ function selectRetainedUserMessages(
 
 /** Rebuild a pi-ai tool result from a persisted tool row. Rows that never
  * finished (app quit / abort mid-tool) restore as errored results so the
- * model knows the call produced nothing. */
-function toolResultFromUi(
+ * model knows the call produced nothing. Exported for tests. */
+export function toolResultFromUi(
   m: UiMessage,
   timestamp: number,
 ): ToolResultMessage {
-  const raw = m.toolResult as
-    | { content?: unknown; details?: unknown }
-    | string
-    | null
-    | undefined;
+  const raw: unknown = m.toolResult;
   const blocks: ToolResultMessage["content"] = [];
   const rawBlocks =
     isRecord(raw) && Array.isArray(raw.content) ? raw.content : undefined;
@@ -1478,10 +1570,45 @@ function toolResultFromUi(
         blocks.push({ type: "image", data: b.data, mimeType: b.mimeType });
       }
     }
+  } else if (Array.isArray(raw)) {
+    // Plugin tools may return a bare content-block array; restore its text
+    // and image blocks so a restart does not flatten them into JSON (#1360).
+    for (const b of raw) {
+      if (!isRecord(b)) continue;
+      if (b.type === "text" && typeof b.text === "string") {
+        blocks.push({ type: "text", text: b.text });
+      } else if (
+        b.type === "image" &&
+        typeof b.data === "string" &&
+        typeof b.mimeType === "string"
+      ) {
+        blocks.push({ type: "image", data: b.data, mimeType: b.mimeType });
+      }
+    }
   } else if (typeof raw === "string" && raw.trim()) {
     blocks.push({ type: "text", text: raw });
   } else if (raw !== undefined && raw !== null) {
-    blocks.push({ type: "text", text: safeJson(raw) });
+    // A host Read of an image file returns a top-level `images` array rather
+    // than content blocks; restore those as real image content so the model
+    // sees the picture across a restart, not just the JSON text (#1073).
+    const rawObject = isRecord(raw) ? raw : undefined;
+    const images = rawObject?.images;
+    if (rawObject && Array.isArray(images)) {
+      const rest = { ...rawObject };
+      delete rest.images;
+      blocks.push({ type: "text", text: safeJson(rest) });
+      for (const image of images) {
+        if (
+          isRecord(image) &&
+          typeof image.data === "string" &&
+          typeof image.mimeType === "string"
+        ) {
+          blocks.push({ type: "image", data: image.data, mimeType: image.mimeType });
+        }
+      }
+    } else {
+      blocks.push({ type: "text", text: safeJson(raw) });
+    }
   }
   const interrupted = m.toolStatus === "running";
   const rawRecord: Record<string, unknown> | undefined = isRecord(raw)
@@ -1584,7 +1711,6 @@ export class DesktopAgentRuntime {
   private models: Models;
   private model: Model<Api>;
   private turnId?: string;
-  private hostTurnId?: string;
   private disposed = false;
   readonly sessionId: string;
   private mode: Mode;
@@ -1594,6 +1720,7 @@ export class DesktopAgentRuntime {
   private thinkingLevel: SessionThinkingLevel;
   private host: RuntimeHost;
   private onEvent: (envelope: AgentEventEnvelope) => void;
+  private onDiagnostic: (diagnostic: AgentRuntimeDiagnostic) => void;
   private streamSink: StreamCoalescer;
   private baseSystemPrompt: string;
   private customSystemPrompt?: CustomSystemPrompt;
@@ -1604,6 +1731,7 @@ export class DesktopAgentRuntime {
   private pluginSkills: PluginSkillDef[];
   private trustedExtensionSpecs: TrustedExtensionSpec[];
   private extensionRunner?: TrustedExtensionRunner;
+  private trustedExtensionLoad?: Promise<void>;
   private extensionSessionName?: string;
   private extensionTurnIndex = 0;
   /** Headers an extension edited in `before_provider_headers` for the current turn. */
@@ -1653,8 +1781,11 @@ export class DesktopAgentRuntime {
   private toolCatalog = new Map<string, AgentTool>();
   /** Tools intentionally omitted from the initial provider request. */
   private deferredToolNames = new Set<string>();
-  /** Deferred tools loaded for the current user prompt. */
+  /** Deferred tools activated for this runtime and declaration epoch. */
   private activeDeferredToolNames = new Set<string>();
+  private declarationPolicy?: ToolDeclarationPolicy;
+  private trackToolActivation = false;
+  private activationHydrated = false;
   private scratchDir?: string;
   private projectPath?: string;
   private commandShell: CommandShellOption;
@@ -1774,6 +1905,8 @@ export class DesktopAgentRuntime {
   private terminatingToolCalls = new Set<string>();
   private fullEntries: MessageEntry[];
   private executionContextStartIndex: number | null = null;
+  private readonly systemJournal = new SystemTranscriptJournal();
+  private composedSections: Record<string, string> = {};
   private activeCompaction?: ContextCompactionRecord;
   private compactionEnabled: boolean;
   private readonly compactionStrategy: CompactionStrategy;
@@ -1784,6 +1917,7 @@ export class DesktopAgentRuntime {
   private pendingSteering = new Map<AgentMessage, string>();
   private pendingOverflow = false;
   private overflowRecoveryAttempted = false;
+  private overflowRecoveryInProgress = false;
   private suppressOverflowRunEnd = false;
   private turnHadError = false;
   /** Bumped at the start of each parent `prompt()` / `executeApprovedPlan()`. */
@@ -1803,10 +1937,17 @@ export class DesktopAgentRuntime {
   private hostCloseUnsubscribe?: () => void;
   private turnSubagentUsage?: MessageUsage;
   private goalReportDraftManager?: GoalReportDraftManager;
+  private goalProgressManager?: GoalProgressManager;
+  private compactionRequestShape?: CompactionRequestShape;
+  private compactionShapeLogged = false;
+  private compactionDiagnosticBudget?: {
+    hardLimit: number;
+    outputBudget: number;
+    plannedChunks: number;
+  };
 
   constructor(opts: AgentRuntimeOptions) {
     this.sessionId = opts.sessionId;
-    this.hostTurnId = opts.turnId;
     this.turnId = opts.turnId;
     this.mode = opts.mode;
     this.executionProfile = normalizeExecutionProfile(opts.executionProfile);
@@ -1816,13 +1957,14 @@ export class DesktopAgentRuntime {
     this.thinkingLevel = clampThinkingLevel(opts.provider, opts.thinkingLevel);
     this.infiniteProviderRetry = opts.infiniteProviderRetry === true;
     this.host = opts.host;
+    this.onDiagnostic = opts.onDiagnostic ?? (() => undefined);
     this.hostCloseUnsubscribe = this.host.onClose?.(() => {
       this.cleanupActiveToolProgress();
     });
     this.streamSink = createStreamCoalescer(opts.onEvent);
     this.onEvent = (envelope) => this.streamSink.push(envelope);
     this.pluginTools = opts.pluginTools ?? [];
-    this.pluginSkills = opts.pluginSkills ?? [];
+    this.pluginSkills = [...(opts.pluginSkills ?? [])].sort((left, right) => left.id.localeCompare(right.id));
     this.trustedExtensionSpecs = opts.trustedExtensions ?? [];
     this.subagents = opts.subagents ?? [];
     this.subagentProviders = opts.subagentProviders ?? {};
@@ -1846,7 +1988,6 @@ export class DesktopAgentRuntime {
     this.rebuildToolCatalog();
     const model = buildProviderModel(this.provider);
     this.model = model;
-    const tools = this.activeTools();
     const models = createProviderModels(this.provider, model);
     this.models = models;
     const runtimeApiKey = providerRequestKey(this.provider);
@@ -1857,77 +1998,37 @@ export class DesktopAgentRuntime {
     this.delegationChains.hydrate(
       rebuildChainsFromTranscript(this.transcriptHistory),
     );
-    const skillsPrompt = pluginSkillsPrompt(this.pluginSkills);
     // Parts: [0] is the product persona; [1:] are operational rules a custom
     // SYSTEM.md must not remove (tool guidance, delegation, scratch, skills).
     const defaultSystemPromptParts = [
       DEFAULT_RUNTIME_SYSTEM_PROMPT,
-      // Collaboration rules. Measured sessions ran hours with 380 assistant
-      // messages and exactly one non-empty text body: a reasoning model reads
-      // "prefer concise" as "say nothing", writes its conclusion into thinking
-      // (which the user never sees), and the user is left sending "继续" to
-      // find out whether anything happened. Every clause below is one of those
-      // observed failures stated as a hard rule.
-      "Collaboration: answer in the same language the user writes in. Before each batch of tool calls, write one short sentence saying what you are about to do in the same assistant message as those calls; never leave the user with no new text for more than one tool batch or 60 seconds of work. Whatever the user asked must be answered in your visible text — your reasoning is not shown to them, so a conclusion that lives only there never reached them. Make the final message self-contained: the outcome, what you changed, and anything still open, without asking the user to re-read intermediate updates. Carry the work through end to end; when you hit a blocker, try to clear it yourself and report what you tried, instead of stopping at analysis or a half-finished change.",
-      // Delegation steering (ADR 0089). The trigger patterns below are the
-      // proactive half of the Task tool's own description: models delegate
-      // when the system prompt names the situations, and keep doing everything
-      // inline when it only says "you may".
-      ...(this.executionProfile === "team"
-        ? [
-            teamSystemPrompt({
-              isLead: this.teamContext?.isLead ?? false,
-              memberName: this.teamContext?.memberName,
-              teamSessionId: this.teamContext?.teamSessionId ?? "",
-            }),
-          ]
-        : this.subagents.length
+      // Workflow rules.
+      "Complete the requested work and relevant checks without expanding scope. Preserve unrelated user changes. Resolve recoverable blockers yourself.",
+      // Visibility rules.
+      "Before each tool batch, briefly state its purpose. Keep the user informed during long work. The final response must state the outcome, verification, and remaining blockers. Never claim actions or checks you did not perform.",
+      // Delegation steering (ADR 0089).
+      ...(this.executionProfile !== "team" && this.subagents.length
         ? [
             `## Delegation
-Work splits into independent pieces — delegate, and keep your context for the synthesis. Subagents run in their own context and report back through TaskWait.
-
-Use the Task tool when:
-- Parallel exploration: two or more independent directions (for example one subagent per subsystem, or backend + frontend + tests). Start one Task per direction in the same assistant message.
-- Adversarial review: after implementing a non-trivial change, delegate a read-only review of it to code-reviewer before you commit.
-- Implementation: a multi-file change with a complete, self-contained spec — delegate to fixer, which may write inside the workspace.
-- Context economy: wide searches, long logs, multi-file surveys whose intermediate output you do not need — explorer / test-runner.
-- Batch sharding: the same bounded job repeated over many independent targets.
-
-Delegation rules:
-- Task returns immediately with a delegation id. Do not sit idle: keep working on your own independent line, then converge with TaskWait (mode="any" + minCompleted to converge early) when you need results, TaskList to check progress, TaskStop to stop.
-- Always fill Task's \`description\` so the user sees what each subagent is doing. Integrate findings and say which subagent produced what.
-- You may talk to the user while subagents run. Do not TaskStop unless you have decided the work should not continue. The runtime keeps them alive and delivers their reports when they finish — ending your turn does not abort them.
-- Never delegate what you can finish in a couple of tool calls, and never delegate anything that needs the user.`,
+Do the work yourself by default. Delegate only bounded, independent tasks with a clear benefit over direct execution.
+No recursive delegation, duplicate work, or agent debates.
+Allow at most one optional review pass unless the user requests more. Fix and retest concrete, in-scope defects without restarting broad reviews.
+Do not invent objections or turn speculative risks into blockers. Stop when the requested work is complete and relevant checks pass, or report a genuine blocker.`,
             ...(this.subagentModelSummary()
               ? [this.subagentModelSummary()!]
               : []),
           ]
         : []),
-      // Search-tool steering. Read/Grep/Glob are host-bounded and scopeable;
-      // hand-rolled shell pipelines are not, and unbounded shell output is
-      // what exhausted context and forced repeated re-searching.
-      "Searching and reading: prefer the Read, Grep, and Glob tools over shell `cat`, `sed`, `head`, `grep`, or `find`. Read accepts only an existing regular text file, never a directory. If a file name is uncertain or a directory must be listed, use Glob instead of guessing a file name or calling Read on the directory; in Agent mode, activate it with ToolSearch for the current prompt when it is unavailable. Scope every search with the native parameters: Grep takes a file-or-directory `path` plus `include`, `outputMode`, and `headLimit`; Glob takes a directory `path` and `limit`; Read takes `offset` and `limit`, always reports `totalLines`, and paginates any supported text file however large; for files beyond the default window, use Grep to locate the target lines first, then Read the relevant range. Use `outputMode: \"filesWithMatches\"` or `\"count\"` when file contents are not needed, and use `include` to avoid scanning generated or vendor trees. These tools bound their own output; a shell pipeline does not, and one unscoped search over a whole workspace costs context you will need later. Workspace-relative paths are portable across macOS, Linux, and Windows; an explicit path outside the workspace and session scratch roots asks for permission unless the effective mode is Auto, so do not retry a denied path blindly. Grep uses the system's `rg` when it is installed and an in-process searcher otherwise — call Grep, do not shell out to `rg`. When a search genuinely needs Bash, use the active shell's syntax and a bounded command, and never assume POSIX utilities, `/`-based paths, or PowerShell commands on every platform. Do not re-run a search whose answer you already have.",
-      // Observed leak: OpenAI-style models sometimes emit the internal
-      // `multi_tool_use.parallel` wrapper as assistant text. PI-Desktop has no
-      // such tool, so the whole batch is silently lost as prose.
-      "Call tools through the native tool-call interface only. Never write a tool call as text, and never emit a `multi_tool_use.parallel` / `{\"tool_uses\": [...]}` wrapper — there is no such tool here, and a call written as prose does not run. To run several tools at once, emit several real tool calls in one assistant message.",
-      "Editing workflow: use the built-in Edit or Write tool directly on the deliverable file whenever it is inside the advertised workspace. Use Edit for one small unique line-anchored change (path + tag + ops) and Write for a coherent whole-file rewrite. Do not invoke shell apply_patch, git apply, or patch commands; do not create or hand-edit unified-diff files in scratch or repeatedly repair their hunk headers. Treat an edit or shell patch failure as recoverable state: classify the error, perform the required fresh Read or use a complete reveal, regenerate the change, and retry with a corrected payload. A path may have three counted failures per prompt; stop after the third and report the exact mismatch instead of looping. Never issue concurrent Write/Edit calls for the same path. When a dedicated worktree is outside the advertised workspace, make one guarded, deterministic edit inside that worktree with Bash, then verify it with git diff or an equivalent check.",
-      // Work panel browser preview (D100): workspace HTML files render
-      // in the embedded browser with live reload on file changes.
-      `For user-visible HTML pages, call the BrowserPreview tool once after creating the page or making the first meaningful visual edit, using its workspace-relative path (e.g. \`index.html\` or \`demo/index.html\`) to show it in Pi-Desktop-Plus's built-in browser panel. Reuse that preview while iterating: it live-reloads as you edit, so no repeat call or manual refresh is needed. Skip generated, test-only, and non-visual HTML files. If BrowserPreview is not in the current tool list, load it first with ${TOOL_SEARCH_NAME}.`,
+      // Editing workflow.
+      `Editing workflow: inside the advertised workspace, use Edit for small, uniquely anchored changes and Write for new files or intentional whole-file rewrites. Never modify the same path concurrently. Do not use shell apply_patch, git apply, patch, or hand-edited unified-diff files. On failure, diagnose the cause, refresh content or anchors with Read or a complete tool-provided reveal when needed, and correct the payload before retrying. After three failed edit attempts on the same path in one user turn, stop editing that path, report the exact error, and continue unblocked work. For an authorized worktree outside the advertised workspace, use a guarded, deterministic Bash edit that aborts on unexpected content, then verify the diff.`,
       // Shell dialect and scratch variable are selected by host-core.
       commandShellGuidance(this.commandShell, this.scratchDir),
-      // Session scratch directory (D114): temp files must not dirty
-      // the user's workspace or its git status.
+      // Session scratch directory (D114).
       ...(this.scratchDir
         ? [
-            `Your scratch directory for this session is \`${this.scratchDir}\` (in Bash: $PI_SCRATCH_DIR). Write ALL temporary and intermediate files there using absolute paths — one-off scripts, downloaded data, drafts, experiment output — never into the workspace. Only write into the workspace when the file is a deliverable the user asked for. Scratch files persist across turns of this session and are cleaned up automatically when the session is deleted.`,
+            `Your scratch directory for this session is \`${formatScratchDirForShell(this.commandShell, this.scratchDir)}\` (in Bash: ${shellScratchVariable(this.commandShell)}). Store ad-hoc temporary and intermediate files there using absolute paths. Workspace writes must be task-related project files or required toolchain outputs. Scratch persists across turns and is deleted with the session.`,
           ]
         : []),
-      // Plugin skills (D174): the catalog rides in the base prompt so a
-      // path-scoped instruction reload never drops it, and it stays ahead of
-      // the instruction chain so the user's own AGENTS.md keeps the last word.
-      ...(skillsPrompt ? [skillsPrompt] : []),
     ];
     // A custom SYSTEM.md replaces only the product persona line, never the
     // operational rules in the default parts: tool guidance, delegation
@@ -1940,6 +2041,9 @@ Delegation rules:
       ).trim(),
       ...defaultSystemPromptParts.slice(1),
     ].join("\n\n");
+    this.refreshToolDeclarationPolicy();
+    this.restoreDeferredToolsFromContext();
+    const tools = this.declaredTools();
     this.agent = new Agent({
       streamFn: (m, context, options) => {
         this.setAgentActivity({ phase: "waiting-model", since: Date.now() });
@@ -1970,21 +2074,24 @@ Delegation rules:
               // failed response separately so a 429 can honor Retry-After headers,
               // and capture the transport cause of a rejection while the original
               // Error still exists (issue #234).
-              fetch: captureProviderResponse(
-                options?.fetch,
-                (response, requestBytes, failure) => {
-                  this.providerResponseStatus = response?.status;
-                  this.providerRequestBytes = requestBytes;
-                  this.providerFetchFailure = failure;
-                  if (failure) this.recoverProviderTransport(failure);
-                  // A gateway 502/503 can also state Retry-After, so keep headers
-                  // for every status whose delay is usable, not only for 429.
-                  this.providerRetryHeaders = carriesRetryDelayHeaders(
-                    response?.status,
-                  )
-                    ? response?.headers
-                    : undefined;
-                },
+              fetch: providerRequestFetch(
+                m.api,
+                captureProviderResponse(
+                  options?.fetch,
+                  (response, requestBytes, failure) => {
+                    this.providerResponseStatus = response?.status;
+                    this.providerRequestBytes = requestBytes;
+                    this.providerFetchFailure = failure;
+                    if (failure) this.recoverProviderTransport(failure);
+                    // A gateway 502/503 can also state Retry-After, so keep headers
+                    // for every status whose delay is usable, not only for 429.
+                    this.providerRetryHeaders = carriesRetryDelayHeaders(
+                      response?.status,
+                    )
+                      ? response?.headers
+                      : undefined;
+                  },
+                ),
               ),
               onResponse: async (response, responseModel) => {
                 this.providerResponseStatus = response.status;
@@ -2000,7 +2107,7 @@ Delegation rules:
             copilotRequestHeaders(this.provider, context),
             this.provider.headers,
           ),
-          { allowCustomFetch: providerAllowsCustomFetch(this.provider) },
+          m.api,
         );
         const hookedOptions = this.withExtensionProviderHooks(requestOptions, m);
         // The watchdog must be able to *stop* what it abandons. It wraps the
@@ -2024,20 +2131,25 @@ Delegation rules:
             stallAbort.signal,
           ]),
         };
+        const usageTurnId = this.turnId;
         const retryStream = createProviderRetryStream(
           m,
           context,
           attemptOptions,
-          (retryOptions) =>
+          (retryOptions) => accountModelStream(m, () =>
             this.thinkingLevel === "omit"
               ? this.models.stream(omitThinkingModel(m), context, retryOptions)
-              : this.models.streamSimple(m, context, retryOptions),
+              : this.models.streamSimple(m, context, retryOptions), {
+                providerId: this.provider.id,
+                nativeCost: this.provider.modelConfig?.nativeCost,
+                onUsage: (usage) => this.emit({ type: "usage", usage }, usageTurnId),
+              }),
           {
             claim: (error, phase) => this.claimProviderRetry(error, phase),
             headers: () => this.providerRetryHeaders,
             status: () => this.providerResponseStatus,
             failure: () => this.providerFetchFailure,
-            onRetry: ({ error, phase, attempt, delayMs }) => {
+            onRetry: ({ error, attempt, delayMs }) => {
               this.setAgentActivity({
                 phase: "retrying",
                 since: Date.now(),
@@ -2063,19 +2175,24 @@ Delegation rules:
       // The provider's rule that a tool-call id is unique is enforced here, on
       // the last view before the wire: the request is the only place it can be
       // guaranteed for both a rebuilt context and one that grew in this process.
-      convertToLlm: (messages) =>
-        alignRetainedReasoningIdentity(
-          convertToLlm(this.dropDuplicateToolCalls(messages)),
-          this.reasoningReplayIdentity(),
-        ),
+      convertToLlm: async (messages) => {
+        await this.systemJournal.persist(messages, this.fullEntries, async (message) => {
+          await this.host.call("session.appendMessage", {
+            sessionId: this.sessionId, turnId: this.turnId, message,
+          });
+        });
+        return alignRetainedReasoningIdentity(
+          convertToLlm(this.dropDuplicateToolCalls(messages)), this.reasoningReplayIdentity(),
+        );
+      },
       prepareNextTurnWithContext: (context, signal) =>
         this.prepareNextTurn(context, signal),
       afterToolCall: async (context) => this.afterToolCall(context),
       initialState: {
         model,
-        tools,
+        tools: [],
         thinkingLevel: agentThinkingLevel(this.thinkingLevel),
-        messages: initialSystemTranscript(this.composeSystemPrompt(), tools, this.liveSessionContext().messages),
+        messages: initialSystemTranscript(this.composeSystemPrompt(), tools, this.liveSessionContext().messages, this.composedSections),
       },
       // Plan transitions must be the only tool call in an assistant batch.
       // Sequential execution also makes the host-confirmed mode change visible
@@ -2102,6 +2219,9 @@ Delegation rules:
       },
     });
 
+    // Avoid Pi inserting a tool-only baseline ahead of restored legacy rows.
+    this.setAgentTools(tools);
+
     // pi awaits every listener, so a throw here would reject the run in
     // progress and, with nothing awaiting that rejection, could take the whole
     // sidecar down. Contain it: log with the session attached and let the
@@ -2123,10 +2243,38 @@ Delegation rules:
     );
   }
 
+  private logGoalProgressTokenFailure(executionId: string, error: unknown): void {
+    const detail = error instanceof Error
+      ? `${error.name}: ${error.message}`
+      : String(error);
+    process.stderr.write(
+      `[agent-runtime] goal progress unavailable (session=${this.sessionId} execution=${executionId}): ${detail}\n`,
+    );
+  }
+
+  private clearGoalProgressTool(): void {
+    if (!this.goalProgressManager) return;
+    this.goalProgressManager = undefined;
+    this.rebuildToolCatalog();
+    this.setAgentTools(this.activeTools());
+  }
+
   /** Update the opt-in retry policy without rebuilding an idle runtime. */
   setInfiniteProviderRetry(enabled: boolean): void {
     if (this.disposed) throw new Error("runtime disposed");
     this.infiniteProviderRetry = enabled;
+  }
+
+  /** Refresh catalog instructions without changing the running session owner. */
+  setPluginSkills(skills: PluginSkillDef[]): void {
+    if (this.disposed) throw new Error("runtime disposed");
+    if (this.getStatus().isRunning) throw new Error("cannot update skills during an active turn");
+    const sorted = [...skills].sort((left, right) => left.id.localeCompare(right.id));
+    if (pluginSkillsDigest(this.pluginSkills) === pluginSkillsDigest(sorted)) return;
+    this.pluginSkills = sorted;
+    this.rebuildToolCatalog();
+    this.setAgentTools(this.activeTools());
+    this.setAgentSystemPrompt(this.composeSystemPrompt());
   }
 
   /** Switch the planning state on this Agent without creating another Agent. */
@@ -2169,7 +2317,9 @@ Delegation rules:
       (this.agent.state as unknown as { systemPrompt: string }).systemPrompt = prompt;
       return;
     }
-    this.agent.state.messages = replaceSystemPrompt(this.agent.state.messages, prompt);
+    this.agent.state.messages = prompt === this.composedSystemPrompt
+      ? syncSystemSections(this.agent.state.messages, this.composedSections)
+      : replaceSystemPrompt(this.agent.state.messages, prompt);
   }
 
   private setAgentMessages(messages: AgentMessage[]): void {
@@ -2177,16 +2327,18 @@ Delegation rules:
       this.agent.state.messages = messages;
       return;
     }
-    this.agent.state.messages = syncSystemTools(
-      rebuildSystemTranscript(this.agent.state.messages, messages),
-      this.agent.state.tools,
+    this.agent.state.messages = rebuildSystemTranscript(
+      this.agent.state.messages.filter((message) => message.role !== "system" || !this.systemJournal.isPersisted(message)), messages,
     );
   }
 
   private setAgentTools(tools: AgentTool[]): void {
-    this.agent.state.tools = tools;
-    if (this.agentUsesTranscriptSystemMessages()) {
-      this.agent.state.messages = syncSystemTools(this.agent.state.messages, tools);
+    this.agent.state.tools = this.declarationPolicy?.tools ?? tools;
+    if (this.trackToolActivation && this.declarationPolicy) {
+      const section = toolActivationSection(this.declarationPolicy.key, this.activeDeferredToolNames);
+      this.composedSections = { ...this.composedSections, [TOOL_ACTIVATION_SECTION]: section };
+      this.composedSystemPrompt = Object.values(this.composedSections).filter(Boolean).join("\n\n");
+      this.agent.state.messages = syncToolActivation(this.agent.state.messages, section);
     }
   }
 
@@ -2206,17 +2358,30 @@ Delegation rules:
             runningDelegationIds: this.runningDelegationIds(),
           })
         : "";
-    const composed = composeModeSystemPrompt(
-      this.mode,
-      [
-        this.baseSystemPrompt,
+    this.composedSections = {
+      runtime: this.baseSystemPrompt,
+      ...(this.trackToolActivation && this.declarationPolicy ? {
+        [TOOL_ACTIVATION_SECTION]: toolActivationSection(this.declarationPolicy.key, this.activeDeferredToolNames),
+      } : {}),
+      ...pluginSkillsPromptSections(this.pluginSkills),
+      context: composeModeSystemPrompt(this.mode, [
         ...(this.customSystemPrompt?.append ? [this.customSystemPrompt.append] : []),
+        ...(this.mode === "agent" && this.executionProfile === "team"
+          ? [
+              teamSystemPrompt({
+                isLead: this.teamContext?.isLead ?? false,
+                memberName: this.teamContext?.memberName,
+                teamSessionId: this.teamContext?.teamSessionId ?? "",
+              }),
+            ]
+          : []),
         ...(optionalToolsPrompt ? [optionalToolsPrompt] : []),
         ...(projectPrompt ? [projectPrompt] : []),
         ...(memoryPrompt ? [memoryPrompt] : []),
         ...(resumablePrompt ? [resumablePrompt] : []),
-      ].join("\n\n"),
-    );
+      ].join("\n\n")),
+    };
+    const composed = Object.values(this.composedSections).filter(Boolean).join("\n\n");
     this.composedSystemPrompt = composed;
     return composed;
   }
@@ -2380,6 +2545,9 @@ Delegation rules:
   private async beforeToolCall(
     context: BeforeToolCallContext,
   ): Promise<BeforeToolCallResult | undefined> {
+    if (this.deferredToolNames.has(context.toolCall.name) && !this.activeDeferredToolNames.has(context.toolCall.name)) {
+      return { block: true, reason: `Call ${TOOL_SEARCH_NAME} to activate ${context.toolCall.name} before using it. A tool declaration does not grant execution permission.` };
+    }
     const toolCalls = (context.assistantMessage.content as Array<{ type?: string }>).filter(
       (block) => block.type === "toolCall",
     );
@@ -2393,7 +2561,12 @@ Delegation rules:
         reason: `${[...MODE_TRANSITION_TOOL_NAMES].join(", ")} must be the only tool call in the assistant message.`,
       };
     }
-    if (!transition) return this.extensionToolCall(context);
+    if (!transition) {
+      if (!this.isToolAllowedInMode(context.toolCall.name)) {
+        return { block: true, reason: modeToolDenial(context.toolCall.name, this.mode) };
+      }
+      return this.extensionToolCall(context);
+    }
     const enterKind = enterToolKind(context.toolCall.name);
     if (enterKind && this.mode !== "agent") {
       return {
@@ -2437,9 +2610,8 @@ Delegation rules:
   /** True when this runtime can be reused for a prompt with the given config. */
   matches(config: RuntimeMatchConfig): boolean {
     const requestedPluginTools = config.pluginTools ?? [];
-    const requestedPluginSkills = config.pluginSkills ?? [];
-    const current = this.pluginTools.map((t) => t.name).sort().join(",");
-    const next = requestedPluginTools.map((t) => t.name).sort().join(",");
+    const current = safeJson([...this.pluginTools].sort((a, b) => a.name.localeCompare(b.name)));
+    const next = safeJson([...requestedPluginTools].sort((a, b) => a.name.localeCompare(b.name)));
     const currentThinkingLevels = [
       ...(this.provider.supportedThinkingLevels ?? ["off"]),
     ]
@@ -2483,10 +2655,6 @@ Delegation rules:
         safeJson(config.customSystemPrompt ?? null) &&
       (this.projectMemory ?? "") === (config.projectMemory?.trim() ?? "") &&
       (this.projectPath ?? "") === (config.projectPath?.trim() ?? "") &&
-      // Enabling a plugin, revoking agent.prompt.inject or renaming a skill
-      // changes the catalog digest, which retires the runtime and its stale
-      // prompt. Bodies are excluded: the Skill tool always reads them fresh.
-      pluginSkillsDigest(this.pluginSkills) === pluginSkillsDigest(requestedPluginSkills) &&
       // Editing `~/.agents/subagents/*.md` must reach the next prompt. Definition
       // bodies are part of the `Task` tool's behavior, so unlike skills they
       // are compared in full.
@@ -2508,6 +2676,19 @@ Delegation rules:
    * never fails the session.
    */
   async loadTrustedExtensions(): Promise<void> {
+    if (this.disposed || this.extensionRunner || this.trustedExtensionSpecs.length === 0) return;
+    if (this.trustedExtensionLoad) return this.trustedExtensionLoad;
+    const loading = this.loadTrustedExtensionsForSession();
+    this.trustedExtensionLoad = loading;
+    try {
+      await loading;
+    } finally {
+      if (this.trustedExtensionLoad === loading) this.trustedExtensionLoad = undefined;
+    }
+  }
+
+  private async loadTrustedExtensionsForSession(): Promise<void> {
+    const { TrustedExtensionRunner } = await import("./extensions/runner.js");
     if (this.disposed || this.extensionRunner || this.trustedExtensionSpecs.length === 0) return;
     const runner = new TrustedExtensionRunner({
       specs: this.trustedExtensionSpecs,
@@ -2597,6 +2778,10 @@ Delegation rules:
   private extensionModelRegistry(): Record<string, unknown> {
     const getRunner = () => this.extensionRunner;
     const models = () => [this.model, ...(getRunner()?.getAgentModels() ?? [])];
+    const hasConfiguredProvider = (providerId: string) =>
+      providerId === this.provider.id ||
+      providerId === this.model.provider ||
+      (getRunner()?.getAgents().some((agent) => agent.providerId === providerId) ?? false);
     return {
       getAll: () => [...new Map(models().map((model) => [`${model.provider}/${model.id}`, model])).values()],
       getAvailable: () => [...new Map(models().map((model) => [`${model.provider}/${model.id}`, model])).values()],
@@ -2606,12 +2791,11 @@ Delegation rules:
         getRunner()?.getAgents().find((agent) => agent.providerId === providerId)?.name ??
         (providerId === this.provider.id ? this.provider.name : providerId),
       getProviderAuthStatus: (providerId: string) => ({
-        configured: [this.provider.id, ...(getRunner()?.getAgents().map((agent) => agent.providerId) ?? [])].includes(providerId),
+        configured: hasConfiguredProvider(providerId),
         source: "plugin",
       }),
       hasConfiguredAuth: (model: { provider?: string }) =>
-        typeof model.provider === "string" &&
-        [this.provider.id, ...(getRunner()?.getAgents().map((agent) => agent.providerId) ?? [])].includes(model.provider),
+        typeof model.provider === "string" && hasConfiguredProvider(model.provider),
     };
   }
 
@@ -2775,14 +2959,17 @@ Delegation rules:
     // (the nearest one above), keeping each call adjacent to its result as
     // the provider APIs require.
     let toolCarrier: AssistantMessage | undefined;
-    for (const m of history) {
+    for (const m of orderSystemRows(history)) {
       // Subagent rows belong to the transcript and to review, never to the
       // parent's model context (ADR 0062): the parent only ever saw the `Task`
       // report, and replaying a delegate's messages would both contradict that
       // and reintroduce the context cost delegation exists to avoid.
       if (m.parentToolCallId) continue;
       const timestamp = Date.parse(m.createdAt) || Date.now();
-      if (m.role === "user") {
+      if (m.role === "system" && m.modelSystem) {
+        toolCarrier = undefined;
+        append(m.id, this.systemJournal.restore(m));
+      } else if (m.role === "user") {
         toolCarrier = undefined;
         const attachments = (m.attachments ?? []).map((attachment) =>
           runtimeAttachmentFromMessage(
@@ -2829,8 +3016,13 @@ Delegation rules:
           role: "assistant",
           content,
           api,
-          provider: this.provider.id,
-          model: this.provider.modelId,
+          // Persisted providerId identifies a local account; Pi compares its
+          // vendor identity to decide whether native thinking can be replayed.
+          // Keep known account/model switches distinct; legacy rows have no
+          // source identity and retain the existing current-model fallback.
+          provider: !m.providerId || m.providerId === this.provider.id
+            ? this.model.provider : m.providerId,
+          model: m.modelId || this.model.id,
           usage: usageToPi(m.usage),
           stopReason: "stop",
           timestamp,
@@ -2846,8 +3038,8 @@ Delegation rules:
             role: "assistant",
             content: [],
             api,
-            provider: this.provider.id,
-            model: this.provider.modelId,
+            provider: this.model.provider,
+            model: this.model.id,
             usage: usageToPi(undefined),
             stopReason: "toolUse",
             timestamp,
@@ -2898,8 +3090,11 @@ Delegation rules:
   ): Entry[] {
     const entries: Entry[] = this.executionContextStartIndex === null
       ? [...this.fullEntries]
-      : this.fullEntries.slice(this.executionContextStartIndex);
+      : entriesFromExecutionStart(this.fullEntries, this.executionContextStartIndex);
     if (!checkpoint) return entries;
+    if (isRecord(checkpoint.details) && checkpoint.details.systemMessageJson) {
+      this.systemJournal.rememberCheckpoint(checkpoint.details.systemMessageJson);
+    }
     const throughIndex = entries.findIndex(
       (entry) => entry.id === checkpoint.throughMessageId,
     );
@@ -2991,8 +3186,10 @@ Delegation rules:
           return `Replace, insert, or delete lines in an existing file. Names positions and supplies new content only — never old_string. Required: path, tag (4 hex from the latest Read/Grep/Write/Edit), ops. Ops: PUT N.=M: replace inclusive lines N–M; PUT <N: insert before N; PUT >N: insert after N; PUT >$: append; CUT N.=M delete; REM delete the file; MV DEST rename after other ops. Body rows are + plus the final line text. Every PUT with body rows must include the trailing colon, for example PUT 48.=48:; PUT 48.=48 followed by + rows is invalid. A colonless PUT is only for a register paste such as PUT <1 @name. No -old or context rows. Ranges name only the lines being changed. Re-ground on the tag returned by every successful write. After one failed Edit, classify the error: Read the live file for a stale tag or unseen lines (or retry unchanged on a complete EDIT_LINES_UNSEEN reveal), but correct syntax or range errors directly; do not guess. Do not edit the same path concurrently.${scratchPathHint}${externalPathHint}`;
         case "Bash":
           return `${commandShellToolDescription(this.commandShell, this.scratchDir)} Use Edit or Write instead of apply_patch, git apply, or patch; do not retry a failed shell patch command repeatedly.`;
+        case "TodoWrite":
+          return todoWriteDescription;
         case ASK_TOOL_NAME:
-          return "Ask the user one or more questions. Each question has selectable options and the desktop card always provides a custom user-input option; unanswered questions are returned as empty answers.";
+          return "Ask the user one or more questions. Use Markdown in question text and option labels when formatting helps (for example, emphasis, inline code, or lists); the desktop card renders it safely. Plain strings and existing `{ label, description? }` options are accepted; descriptions remain plain text and answers return the selected source label. The card always provides a custom user-input option.";
         case "PluginScaffold":
           return "Create a Pi-Desktop-Plus plugin from a template and load it for development. `directory` is workspace-relative and must be empty or new; `template` is one of panel-basic, agent-tool-basic, skill-pack, full-demo. Use this instead of hand-writing plugin files.";
         case "PluginCheck":
@@ -3007,6 +3204,7 @@ Delegation rules:
     // stopped being readable.
     const parameters: Record<string, Parameters<typeof Type.Object>[0]> = {
       GenerateImages: imageGenerationParameters,
+      TodoWrite: todoWriteParameters,
       Read: {
         path: pathParam(
           "Existing regular file only, never a directory; workspace-relative or explicitly approved.",
@@ -3068,14 +3266,30 @@ Delegation rules:
       Edit: {
         path: pathParam("File to edit; workspace-relative."),
         file_path: aliasParam("path"),
-        tag: Type.String({
-          description:
-            "4 uppercase hex from the latest Read, Grep, Write, or Edit for this path.",
-        }),
-        ops: Type.String({
-          description:
-            "One or more operation headers with + body rows, newline separated. A PUT with body rows must end its header with `:` (for example, `PUT 48.=48:`); `PUT 48.=48` followed by + rows is invalid. A colonless PUT is only for a register paste such as `PUT <1 @name`.",
-        }),
+        tag: Type.Optional(
+          Type.String({
+            description:
+              "4 uppercase hex from the latest Read, Grep, Write, or Edit for this path. Required unless legacy old_string/new_string is used.",
+          }),
+        ),
+        ops: Type.Optional(
+          Type.String({
+            description:
+              "One or more operation headers with + body rows, newline separated. A PUT with body rows must end its header with `:` (for example, `PUT 48.=48:`); `PUT 48.=48` followed by + rows is invalid. A colonless PUT is only for a register paste such as `PUT <1 @name`. Required unless legacy old_string/new_string is used.",
+          }),
+        ),
+        old_string: Type.Optional(
+          Type.String({
+            description:
+              "Legacy text replacement: exact text to be replaced (must match exactly once in the target file).",
+          }),
+        ),
+        new_string: Type.Optional(
+          Type.String({
+            description:
+              "Legacy text replacement: new text to replace old_string with.",
+          }),
+        ),
       },
       Bash: {
         command: Type.String(),
@@ -3337,8 +3551,54 @@ Delegation rules:
         const imageBlocks: Array<{ type: "image"; data: string; mimeType: string }> = [];
         let text: string;
         let details: unknown = rawContent;
+        const vision = visionFromModelConfig(this.provider.modelConfig);
+        // Collect image blocks from a content-block array; only well-formed
+        // image entries ({ type, data, mimeType }) are accepted.
+        const collectImageBlocks = (blocks: unknown[]): void => {
+          for (const block of blocks) {
+            if (
+              isRecord(block) &&
+              block.type === "image" &&
+              typeof block.data === "string" &&
+              typeof block.mimeType === "string"
+            ) {
+              if (vision) {
+                imageBlocks.push({
+                  type: "image",
+                  data: block.data,
+                  mimeType: block.mimeType,
+                });
+              }
+            }
+          }
+        };
         if (typeof rawContent === "string") {
           text = rawContent;
+        } else if (Array.isArray(rawContent)) {
+          // Plugin tools may return a bare content-block array
+          // ([{ type: "text" }, { type: "image" }]); render the text blocks
+          // and hand images to the model instead of stringifying (#1360).
+          const textParts: string[] = [];
+          for (const block of rawContent) {
+            if (isRecord(block) && block.type === "text" && typeof block.text === "string") {
+              textParts.push(block.text);
+            }
+          }
+          collectImageBlocks(rawContent);
+          text = textParts.join("\n") || JSON.stringify(rawContent, null, 2);
+          details = { blocks: rawContent, imageCount: imageBlocks.length };
+        } else if (isRecord(rawContent) && Array.isArray(rawContent.content)) {
+          // MCP tools return `content: [{ type: "image" | "text", ... }]`.
+          const contentBlocks = rawContent.content;
+          const textParts: string[] = [];
+          for (const block of contentBlocks) {
+            if (isRecord(block) && block.type === "text" && typeof block.text === "string") {
+              textParts.push(block.text);
+            }
+          }
+          collectImageBlocks(contentBlocks);
+          text = textParts.join("\n") || JSON.stringify(rawContent, null, 2);
+          details = { ...rawContent, imageCount: imageBlocks.length };
         } else if (isRecord(rawContent) && Array.isArray(rawContent.images)) {
           text =
             typeof rawContent.text === "string"
@@ -3348,7 +3608,6 @@ Delegation rules:
                   null,
                   2,
                 );
-          const vision = visionFromModelConfig(this.provider.modelConfig);
           for (const image of rawContent.images) {
             if (
               !isRecord(image) ||
@@ -3413,7 +3672,15 @@ Delegation rules:
         questions: Type.Array(
           Type.Object({
             question: Type.String(),
-            options: Type.Array(Type.String()),
+            options: Type.Array(
+              Type.Union([
+                Type.String(),
+                Type.Object({
+                  label: Type.String(),
+                  description: Type.Optional(Type.String()),
+                }),
+              ]),
+            ),
             multiSelect: Type.Optional(Type.Boolean()),
           }),
         ),
@@ -3450,8 +3717,8 @@ Delegation rules:
 
     // BrowserPreview is non-mutating (renders an existing workspace file in
     // the work panel browser), so it ships in every mode. PluginCheck only
-    // reads a directory; PluginScaffold and PluginPack write, so they follow
-    // Write/Edit/Bash into agent mode only.
+    // reads a directory; PluginScaffold and PluginPack write and remain
+    // Agent-only. Write/Edit keep guarded declarations in contract modes.
     const tools =
       this.mode === "agent"
         ? [
@@ -3463,8 +3730,9 @@ Delegation rules:
             "Grep",
             "BrowserPreview",
             "PluginCheck",
+            "TodoWrite",
           ]
-        : ["Read", "Glob", "Grep", "BrowserPreview", "Bash"];
+        : ["Read", "Glob", "Grep", "BrowserPreview", "Bash", "Write", "Edit"];
     if (this.mode === "agent") {
       tools.push("PluginScaffold", "PluginPack", "GenerateImages", ...Object.keys(scheduledToolParameters));
     }
@@ -3525,13 +3793,13 @@ Delegation rules:
       this.mode === "agent"
         ? [this.buildEnterModeTool("plan"), this.buildEnterModeTool("goal")]
         : [this.buildSubmitTool(this.mode)];
-    // Delegation is an Agent-mode capability: Plan and Goal are read-only
-    // contract negotiations, and a delegate with Bash or Edit would drive
-    // straight through that (ADR 0062). The whole lifecycle rides together:
-    // `Task` starts, `TaskWait`/`TaskList`/`TaskStop` converge (ADR 0089).
+    // Keep configured delegation declarations stable across mode changes.
+    // Contract modes reject execution before handlers can spawn/control a
+    // delegate; publishing a schema never grants delegation permission.
+    // Expert Team sessions delegate through the Team tools below instead of `Task`.
     const isTeam = this.executionProfile === "team";
     const subagentTools =
-      !isTeam && this.mode === "agent" && this.subagents.length
+      !isTeam && this.subagents.length
         ? [
             this.buildSubagentTool(),
             this.buildSubagentWaitTool(),
@@ -3539,12 +3807,13 @@ Delegation rules:
             this.buildSubagentStopTool(),
           ]
         : [];
-    const teamTools = isTeam
+    const teamTools = isTeam && this.mode === "agent"
       ? createTeamTools({
           teamSessionId: this.teamContext?.teamSessionId ?? "",
           callerSessionId: this.teamContext?.callerSessionId ?? this.sessionId,
           isLead: this.teamContext?.isLead ?? false,
           host: this.host,
+          getTurnId: () => this.turnId,
           abortActiveTurn: this.teamContext?.abortActiveTurn,
         })
       : [];
@@ -3560,6 +3829,9 @@ Delegation rules:
     const goalReportTools = this.goalReportDraftManager
       ? [this.goalReportDraftManager.buildTool()]
       : [];
+    const goalProgressTools = this.goalProgressManager
+      ? [this.goalProgressManager.buildTool()]
+      : [];
     return [
       ...builtins,
       askTool,
@@ -3571,18 +3843,19 @@ Delegation rules:
       ...contextTools,
       ...extensionTools,
       ...goalReportTools,
+      ...goalProgressTools,
     ];
   }
 
   /**
-   * Build the complete registry once, then expose only the core subset to the
-   * first provider request. This mirrors pi's active-tool model while keeping
-   * the host tool implementation and permission path unchanged.
+   * Build the complete registry before selecting fixed or on-demand
+   * declarations. Execution activation and Host permissions remain separate
+   * from the provider-visible schemas.
    */
   private rebuildToolCatalog(): void {
     const catalog = new Map<string, AgentTool>();
     for (const tool of this.buildToolDefinitions()) {
-      if (!this.isToolAllowedInMode(tool.name)) continue;
+      if (!this.isToolAllowedInMode(tool.name) && !retainModeToolDeclaration(tool.name)) continue;
       // The execution mode is decided here, in one place, so no tool can grow
       // an accidental parallel batch: everything is sequential except `Task`.
       // pi runs a whole batch sequentially when it holds one sequential tool,
@@ -3592,11 +3865,14 @@ Delegation rules:
       // same declaration (#864).
       catalog.set(
         tool.name,
-        withExplicitRequired({
-          ...tool,
-          executionMode:
-            tool.name === SUBAGENT_TOOL_NAME ? "parallel" : "sequential",
-        }),
+        withModeExecutionGuard(
+          withExplicitRequired({
+            ...tool,
+            executionMode:
+              tool.name === SUBAGENT_TOOL_NAME ? "parallel" : "sequential",
+          }),
+          () => this.isToolAllowedInMode(tool.name) ? undefined : modeToolDenial(tool.name, this.mode),
+        ),
       );
     }
     this.toolCatalog = catalog;
@@ -3619,6 +3895,25 @@ Delegation rules:
         }),
       );
     }
+    if (this.model) this.refreshToolDeclarationPolicy();
+  }
+
+  private refreshToolDeclarationPolicy(): void {
+    const previous = this.declarationPolicy;
+    const policy = toolDeclarationPolicy(this.model, [...this.toolCatalog.values()], this.deferredToolNames, this.composeSystemPrompt(), this.provider.id);
+    if (previous && previous.key !== policy.key && this.trackToolActivation) {
+      this.activeDeferredToolNames.clear();
+      this.activationHydrated = true;
+    }
+    this.declarationPolicy = policy;
+    this.trackToolActivation ||= Boolean(policy.tools || policy.fallback);
+    if (policy.fallback && (previous?.key !== policy.key || previous.fallback !== policy.fallback)) {
+      process.stderr.write(`[agent-runtime] fixed tool declarations unavailable (${policy.fallback}); using on-demand declarations; ToolSearch cache stability is not guaranteed.\n`);
+    }
+  }
+
+  private declaredTools(): AgentTool[] {
+    return this.declarationPolicy?.tools ?? this.activeTools();
   }
 
   private isPlanSafePluginTool(name: string): boolean {
@@ -3651,6 +3946,7 @@ Delegation rules:
   private isCoreTool(name: string): boolean {
     return (
       name === CONTEXT_COMPACTION_TOOL_NAME ||
+      retainModeToolDeclaration(name) ||
       MODE_TRANSITION_TOOL_NAMES.has(name) ||
       // The whole delegation lifecycle stays in the core set rather than the
       // on-demand catalog: a capability the model has to go looking for is one
@@ -3660,6 +3956,8 @@ Delegation rules:
       name === SUBAGENT_LIST_TOOL_NAME ||
       name === SUBAGENT_STOP_TOOL_NAME ||
       name === SUBMIT_GOAL_REPORT_TOOL_NAME ||
+      name === UPDATE_GOAL_PROGRESS_TOOL_NAME ||
+      name === DECLARE_TEAM_STRATEGY_TOOL_NAME ||
       isTeamTool(name) ||
       (this.mode === "agent"
         ? AGENT_CORE_TOOL_NAMES.has(name)
@@ -3708,7 +4006,7 @@ Delegation rules:
     }
     return [
       "# On-demand tools",
-      `The following capabilities are available on demand. Call ${TOOL_SEARCH_NAME} with an exact tool name or a short capability description before using one that is not in the current tool list.`,
+      `The following capabilities are available on demand. Call ${TOOL_SEARCH_NAME} with an exact tool name or a short capability description before using an on-demand tool that has not been activated. A visible schema is not activation; the tool_activation section, when present, records active names.`,
       ...lines,
     ].join("\n");
   }
@@ -3738,7 +4036,7 @@ Delegation rules:
       name: TOOL_SEARCH_NAME,
       label: "Tool Search",
       description:
-        "Find and activate an on-demand tool by exact name or capability. Use this before calling any tool listed under On-demand tools that is not already in the current tool list.",
+        "Find and activate an on-demand tool by exact name or capability. Use this before calling an inactive tool listed under On-demand tools, even when its schema is already visible. Activation does not bypass approval or mode restrictions.",
       parameters: Type.Object({
         query: Type.String({
           description:
@@ -4006,7 +4304,7 @@ Delegation rules:
     }
     if (this.scratchDir && (tools.has("Bash") || tools.has("Write"))) {
       blocks.push(
-        `Write temporary and intermediate files into the session scratch directory \`${this.scratchDir}\` (in Bash: $PI_SCRATCH_DIR) using absolute paths, never into the workspace.`,
+        `Write temporary and intermediate files into the session scratch directory \`${formatScratchDirForShell(this.commandShell, this.scratchDir)}\` (in Bash: ${shellScratchVariable(this.commandShell)}) using absolute paths, never into the workspace.`,
       );
     }
     if (tools.has(SKILL_TOOL_NAME)) {
@@ -4209,8 +4507,8 @@ Delegation rules:
       name: SUBAGENT_TOOL_NAME,
       label: "Task",
       description: [
-        "Start one subagent in the background and return immediately; you keep working while it runs, then converge with TaskWait when you need its report.",
-        "Use it when the work is separable: parallel exploration of independent directions (one Task per direction in the same assistant message), a multi-file implementation with a complete spec (fixer), an adversarial read-only review of a change you just made (code-reviewer), or a wide search / long log / multi-file survey whose intermediate output would otherwise fill this context (explorer, test-runner).",
+        "Start one subagent in the background and return immediately; you keep working while it runs, then converge with TaskWait when you need its report.\n\nPrefer doing the work yourself. Only delegate when it saves significant context or enables genuine parallelism — not for tasks you can finish in a few tool calls.",
+        "Use it only when the work is genuinely separable and substantial: parallel exploration of independent directions that each need many tool calls (one Task per direction in the same assistant message), a large multi-file implementation with a complete spec (fixer), an adversarial read-only review of a non-trivial change you already finished (code-reviewer), or a wide search whose raw output would fill this context (explorer, test-runner). A single file lookup or a small edit does not warrant delegation.",
         "Do not delegate what you can finish in a couple of tool calls, and do not delegate anything that needs the user — a subagent cannot ask a question or propose a plan on your behalf.",
         ...(this.availableSubagentModelKeys().length
           ? [
@@ -4466,6 +4764,8 @@ Delegation rules:
             sessionId: this.sessionId,
             turnId: this.turnId,
             parentToolCallId: toolCallId,
+            delegationId: record.delegationId,
+            scratchDir: this.scratchDir,
             task,
             provider,
             infiniteProviderRetry: this.infiniteProviderRetry,
@@ -4791,6 +5091,7 @@ Delegation rules:
     const tagged: UiMessage = {
       ...row,
       parentToolCallId: envelope.parentToolCallId ?? row.parentToolCallId,
+      nestedParentToolCallId: envelope.nestedParentToolCallId ?? row.nestedParentToolCallId,
       agentName: envelope.agentName ?? row.agentName,
     };
     const key =
@@ -4824,6 +5125,7 @@ Delegation rules:
       toolStatus: event.isError ? "error" : "success",
       isError: Boolean(event.isError),
       parentToolCallId: envelope.parentToolCallId,
+      nestedParentToolCallId: envelope.nestedParentToolCallId,
       agentName: envelope.agentName,
     };
   }
@@ -4996,7 +5298,7 @@ Delegation rules:
         ),
       }),
       executionMode: "sequential",
-      execute: async (toolCallId, params, signal) => {
+      execute: async (_toolCallId, params, signal) => {
         const ids =
           isRecord(params) && Array.isArray(params.delegationIds)
             ? params.delegationIds.map(String)
@@ -5060,6 +5362,9 @@ Delegation rules:
           startedAt: record.startedAt,
           ...(record.completedAt ? { completedAt: record.completedAt } : {}),
           ...(record.result?.error ? { error: record.result.error } : {}),
+          ...(record.result?.scratchReportPath
+            ? { scratchReportPath: record.result.scratchReportPath }
+            : {}),
           report:
             record.status === "running"
               ? formatDelegationHeartbeat(record)
@@ -5271,7 +5576,14 @@ Delegation rules:
   }
 
   private resetDeferredToolsForPrompt(): void {
-    this.activeDeferredToolNames.clear();
+    // Sticky activation (#1225): on-demand tools stay active for the whole
+    // session instead of being reset at every prompt. A context-only restore
+    // drops the activation whenever the announcing rows fall out of the window
+    // (compaction, long turns), and the next direct call then fails with
+    // "Tool <name> not found" at name resolution — the intermittent 0 ms
+    // rejection on Windows. `rebuildToolCatalog` still prunes names that left
+    // the catalog (mode switches, extension reloads), so the set cannot
+    // outlive the tools it names.
     this.restoreDeferredToolsFromContext();
     this.setAgentTools(this.activeTools());
   }
@@ -5287,8 +5599,26 @@ Delegation rules:
    */
   private restoreDeferredToolsFromContext(): void {
     if (this.deferredToolNames.size === 0) return;
+    if (this.trackToolActivation && this.activationHydrated) return;
     const { messages } = this.liveSessionContext();
-    for (const message of messages) {
+    const restored = this.declarationPolicy && restoredToolActivation(messages, this.declarationPolicy.key);
+    if (restored !== undefined) {
+      this.trackToolActivation = true;
+      for (const name of restored.active) {
+        if (this.deferredToolNames.has(name)) this.activeDeferredToolNames.add(name);
+      }
+    }
+    this.activationHydrated = true;
+    const lastSystem = restored ? restored.replayFrom - 1 : messages.map((message) => message.role).lastIndexOf("system");
+    if (!restored && lastSystem >= 0) {
+      for (const tool of getCurrentTools(messages)) {
+        if (this.deferredToolNames.has(tool.name)) this.activeDeferredToolNames.add(tool.name);
+      }
+    }
+    // Legacy histories lack declarations. For current histories, only results
+    // after the last declaration can represent an activation not yet declared.
+    for (const message of messages.slice(lastSystem + 1)) {
+      if (restored && (message.role !== "toolResult" || message.toolName !== TOOL_SEARCH_NAME)) continue;
       if (message.role !== "toolResult" || message.isError) continue;
       if (isMissingToolResultPlaceholder(message.content)) continue;
       const names =
@@ -5376,6 +5706,8 @@ Delegation rules:
             question,
           });
         } catch (error) {
+          const recovery = planWorkspaceRequiredResult(error);
+          if (recovery) return recovery;
           const errorCode =
             (error as { data?: { errorCode?: string } })?.data?.errorCode ??
             "PLAN_SUBMIT_FAILED";
@@ -5478,17 +5810,22 @@ Delegation rules:
     for (const raw of params.questions) {
       if (!isRecord(raw)) return undefined;
       const question = typeof raw.question === "string" ? raw.question.trim() : "";
-      const options = Array.isArray(raw.options)
-        ? raw.options
-            .filter((option): option is string => typeof option === "string")
-            .map((option) => option.trim())
-            .filter(Boolean)
-        : [];
+      const options: AskToolQuestion["options"] = [];
+      const seenLabels = new Set<string>();
+      if (Array.isArray(raw.options)) {
+        for (const rawOption of raw.options) {
+          const option = normalizeAskToolOption(rawOption);
+          if (!option) continue;
+          const label = askToolOptionLabel(option);
+          if (seenLabels.has(label)) continue;
+          seenLabels.add(label);
+          options.push(option);
+        }
+      }
       if (!question || options.length === 0) return undefined;
-      const uniqueOptions = [...new Set(options)];
       questions.push({
         question,
-        options: uniqueOptions,
+        options,
         ...(raw.multiSelect === true ? { multiSelect: true } : {}),
       });
     }
@@ -5820,6 +6157,7 @@ Delegation rules:
   private resetRunRecoveryState(): void {
     this.pendingOverflow = false;
     this.overflowRecoveryAttempted = false;
+    this.overflowRecoveryInProgress = false;
     this.suppressOverflowRunEnd = false;
     this.pendingProviderRetry = undefined;
     this.providerTransientRetryAttempt = 0;
@@ -5929,8 +6267,7 @@ Delegation rules:
 
     // agentLoopContinue refuses a transcript ending in an assistant message,
     // and this one carries nothing worth resending anyway.
-    const messages = [...this.agent.state.messages];
-    while (messages.at(-1)?.role === "assistant") messages.pop();
+    const messages = removeTrailingAssistantMessages(this.agent.state.messages);
     this.setAgentMessages(messages);
 
     const promptBefore = this.agentSystemPromptContent();
@@ -5980,39 +6317,42 @@ Delegation rules:
         this.pendingOverflow = false;
         this.suppressOverflowRunEnd = false;
         this.overflowRecoveryAttempted = true;
-        const messages = [...this.agent.state.messages];
-        while (messages.at(-1)?.role === "assistant") messages.pop();
-        this.setAgentMessages(messages);
-        const compacted = await this.runCompaction(
-          "overflow",
-          true,
-          "active_turn",
-        );
-        if (!compacted) {
-          this.terminateParentTurn();
-          if (this.compactionAborted) {
-            // The user stopped the turn while the checkpoint was being written.
-            // That is an aborted turn, not a compaction failure: close it the
-            // way a stopped stream closes, with no error row.
-            this.finalizeCurrentAssistant("aborted");
-            this.emit({ type: "turn_end" });
-            this.emit({ type: "agent_end", messageIds: [] });
-            return false;
-          }
-          this.emit({
-            type: "error",
-            error: {
+        this.overflowRecoveryInProgress = true;
+        try {
+          const messages = removeTrailingAssistantMessages(this.agent.state.messages);
+          this.setAgentMessages(messages);
+          const compacted = await this.runCompaction(
+            "overflow",
+            true,
+            "active_turn",
+          );
+          if (!compacted) {
+            this.terminateParentTurn();
+            if (this.compactionAborted) {
+              // The user stopped the turn while the checkpoint was being written.
+              // That is an aborted turn, not a compaction failure: close it the
+              // way a stopped stream closes, with no error row.
+              this.finalizeCurrentAssistant("aborted");
+              this.emit({ type: "turn_end" });
+              this.emit({ type: "agent_end", messageIds: [] });
+              return false;
+            }
+            const error = {
               code: "CONTEXT_COMPACTION_FAILED",
               message: "Context overflow recovery could not create a checkpoint",
               retriable: false,
-            },
-          });
-          return false;
+            } satisfies ReturnType<typeof classifyAgentError>;
+            this.finalizeCurrentAssistant("error", error);
+            this.emit({ type: "error", error });
+            return false;
+          }
+          this.turnHadError = false;
+          this.requestStartedAt = Date.now();
+          await this.agent.continue();
+          await this.waitForIdleAndSteering();
+        } finally {
+          this.overflowRecoveryInProgress = false;
         }
-        this.turnHadError = false;
-        this.requestStartedAt = Date.now();
-        await this.agent.continue();
-        await this.waitForIdleAndSteering();
         continue;
       }
       if (this.pendingSilentTurnRerun) {
@@ -6037,8 +6377,7 @@ Delegation rules:
     // pi-agent-core refuses `continue()` when the transcript ends in an
     // assistant message. The progress text is already visible in the reused
     // bubble, so it must not be sent back as model context.
-    const messages = [...this.agent.state.messages];
-    while (messages.at(-1)?.role === "assistant") messages.pop();
+    const messages = removeTrailingAssistantMessages(this.agent.state.messages);
     this.setAgentMessages(messages);
 
     const promptBefore = this.agentSystemPromptContent();
@@ -6093,7 +6432,7 @@ Delegation rules:
         ...(typeof this.agent.state.systemPrompt === "string"
           ? { systemPrompt: this.agent.state.systemPrompt }
           : {}),
-        tools: this.activeTools(),
+        tools: this.declaredTools(),
       },
       this.model,
     );
@@ -6266,7 +6605,7 @@ Delegation rules:
 
   private rebuiltAgentContext(): AgentContext {
     const messages = this.liveSessionContext().messages;
-    const tools = this.activeTools();
+    const tools = this.declaredTools();
     this.setAgentMessages(messages);
     this.setAgentTools(tools);
     return {
@@ -6364,12 +6703,7 @@ Delegation rules:
     return { context };
   }
 
-  /**
-   * Codex's two-tier `maybe_record`, as a system-prompt append for this turn
-   * only. Codex writes its reminders into conversation history; we have no
-   * channel for a synthetic message that stays out of the transcript, and the
-   * append is equivalent without persisting anything.
-   */
+  /** A replaceable reminder section expires when compaction opens a new window. */
   private withContextBudgetReminder(
     context: AgentContext,
     budget: ContextBudget,
@@ -6387,7 +6721,7 @@ Delegation rules:
       ...(systemPrompt ? { systemPrompt } : {}),
       messages: [
         ...context.messages,
-        { role: "system", content: reminder, timestamp: Date.now() },
+        { role: "system", content: "", sections: { [CONTEXT_BUDGET_SECTION]: reminder }, timestamp: Date.now() },
       ],
     } as AgentContext;
   }
@@ -6480,6 +6814,55 @@ Delegation rules:
       error: aborted
         ? { code: "TURN_ABORTED", message: "Context compaction was stopped" }
         : { code: "CONTEXT_COMPACTION_FAILED", message },
+    });
+  }
+
+  private emitCompactionDiagnostic(
+    kind: AgentRuntimeDiagnostic["kind"],
+    requestId: string,
+    data: Record<string, unknown>,
+  ): void {
+    this.onDiagnostic({
+      kind,
+      sessionId: this.sessionId,
+      ...(this.turnId ? { turnId: this.turnId } : {}),
+      requestId,
+      data,
+    });
+  }
+
+  private emitCompactionFailureDiagnostic(
+    requestId: string,
+    reason: CompactionFailureReason,
+    tokensBefore: number | undefined,
+    error: unknown,
+    extra: Record<string, unknown> = {},
+  ): void {
+    if (!this.compactionShapeLogged) {
+      this.emitCompactionDiagnostic("compaction_shape", requestId, {
+        requestShape: extra.requestShape ?? "unobserved",
+        ...(this.compactionRequestShape ?? {}),
+      });
+      this.compactionShapeLogged = true;
+    }
+    const candidate = error as {
+      code?: unknown;
+      details?: { providerStatus?: unknown; requestId?: unknown };
+    };
+    this.emitCompactionDiagnostic("compaction_failure", requestId, {
+      provider: this.provider.id,
+      model: this.provider.modelId,
+      reason,
+      ...(typeof candidate.code === "string" ? { errorCode: candidate.code } : {}),
+      ...(typeof candidate.details?.providerStatus === "number"
+        ? { httpStatus: candidate.details.providerStatus }
+        : {}),
+      ...(typeof candidate.details?.requestId === "string"
+        ? { upstreamRequestId: candidate.details.requestId }
+        : {}),
+      ...(tokensBefore !== undefined ? { tokensBefore } : {}),
+      ...(this.compactionDiagnosticBudget ?? {}),
+      ...extra,
     });
   }
 
@@ -6785,6 +7168,11 @@ Delegation rules:
     mustFitSafeBudget: boolean,
     fallback?: ContextCompactionFallback,
   ): Promise<CheckpointPersistResult> {
+    const systemMessage = systemTranscriptCheckpoint(this.agent.state.messages);
+    checkpoint = {
+      ...checkpoint,
+      details: { ...(isRecord(checkpoint.details) ? checkpoint.details : {}), ...(systemMessage ? { systemMessageJson: JSON.stringify(systemMessage) } : {}) },
+    };
     const compactedBudget = this.contextBudget(
       this.liveSessionContext(checkpoint).messages,
     );
@@ -6810,7 +7198,10 @@ Delegation rules:
     // resetting its `claim_*` flags when the context window turns over.
     this.contextReminderClaimed = false;
     this.contextFallbackReminderClaimed = false;
-    this.setAgentMessages(this.liveSessionContext().messages);
+    this.agent.state.messages = this.liveSessionContext().messages;
+    for (const message of this.agent.state.messages) {
+      if (message.role === "system") this.systemJournal.remember(message, checkpoint.id);
+    }
     this.emit({
       type: "compaction_end",
       reason,
@@ -6935,22 +7326,54 @@ Delegation rules:
     preparation: ShapedPreparation,
     signal: AbortSignal,
   ): Promise<Awaited<ReturnType<typeof compact>>> {
-    return compact(
-      preparation,
-      // The summary is a provider request like any other turn, but
-      // pi-agent-core builds its options itself and never reaches `streamFn`,
-      // so the headers have to ride on the collection.
-      withCompactionRequestHeaders(this.models, this.provider, this.sessionId),
-      this.model,
-      undefined,
-      agentThinkingLevel(this.thinkingLevel),
-      // Without a policy pi-ai returns the first failed response as-is, which
-      // made a single dropped stream or 503 discard the whole summary (#543).
-      // pi's classifier decides what is transient; the waits honour `signal`.
-      COMPACTION_SUMMARY_RETRY_POLICY,
-      undefined,
-      withAbortSignal(signal, BACKGROUND_CONTEXT),
+    const usageTurnId = this.turnId;
+    const requestId = randomUUID();
+    this.compactionRequestShape = undefined;
+    this.compactionShapeLogged = false;
+    const models = withCompactionRequestHeaders(
+      this.models,
+      this.provider,
+      this.sessionId,
+      (usage) => this.emit({ type: "usage", usage }, usageTurnId),
+      (shape) => {
+        this.compactionRequestShape = shape;
+        this.compactionShapeLogged = true;
+        this.emitCompactionDiagnostic("compaction_shape", requestId, {
+          requestShape: "observed",
+          ...shape,
+        });
+      },
     );
+    try {
+      const result = await compact(
+        preparation,
+        // The summary is a provider request like any other turn. The desktop
+        // compaction adapter calls `completeSimple` directly instead of
+        // `streamFn`, so headers have to ride on the collection.
+        models,
+        this.model,
+        undefined,
+        agentThinkingLevel(this.thinkingLevel),
+        // Without a policy pi-ai returns the first failed response as-is, which
+        // made a single dropped stream or 503 discard the whole summary (#543).
+        // pi's classifier decides what is transient; the waits honour `signal`.
+        COMPACTION_SUMMARY_RETRY_POLICY,
+        undefined,
+        signal,
+      );
+      if (!result.ok) {
+        this.emitCompactionFailureDiagnostic(
+          requestId,
+          "summary_provider",
+          preparation.tokensBefore,
+          result.error,
+        );
+      }
+      return result;
+    } catch (error) {
+      this.emitCompactionFailureDiagnostic(requestId, "summary_provider", preparation.tokensBefore, error);
+      throw error;
+    }
   }
 
   /**
@@ -7010,6 +7433,7 @@ Delegation rules:
     signal: AbortSignal,
     retentionMode: CompactionRetentionMode,
   ): Promise<CheckpointBuild> {
+    this.compactionDiagnosticBudget = undefined;
     const entries = this.entriesWithCompaction();
     const context = buildSessionContext(entries, this.reasoningReplayIdentity());
     const budget = this.contextBudget(context.messages);
@@ -7020,6 +7444,21 @@ Delegation rules:
       retentionMode,
     );
     if (!preparation.ok || !preparation.value) {
+      this.emitCompactionFailureDiagnostic(
+        randomUUID(),
+        preparation.ok ? "no_new_history" : "summary_budget",
+        undefined,
+        preparation.ok ? "No new context is available to compact" : preparation.error,
+        {
+          requestShape: "not_sent",
+          hardLimit: budget.hardLimit,
+          outputBudget: compactionSummaryOutputBudget({
+            requestHeadroom: budget.requestHeadroom,
+            modelMaxTokens: this.model.maxTokens,
+          }),
+          plannedChunks: 0,
+        },
+      );
       return {
         ok: false,
         entries,
@@ -7043,7 +7482,30 @@ Delegation rules:
     const chunks = summaryInput
       ? undefined
       : this.planSummaryRequests(preparation.value, budget);
+    this.compactionDiagnosticBudget = {
+      hardLimit: budget.hardLimit,
+      outputBudget: compactionSummaryOutputBudget({
+        requestHeadroom: budget.requestHeadroom,
+        modelMaxTokens: this.model.maxTokens,
+      }),
+      plannedChunks: chunks?.length ?? 1,
+    };
     if (!summaryInput && !chunks) {
+      this.emitCompactionFailureDiagnostic(
+        randomUUID(),
+        "summary_budget",
+        preparation.value.tokensBefore,
+        "Compaction summary input exceeds the safe model budget",
+        {
+          requestShape: "not_sent",
+          hardLimit: budget.hardLimit,
+          outputBudget: compactionSummaryOutputBudget({
+            requestHeadroom: budget.requestHeadroom,
+            modelMaxTokens: this.model.maxTokens,
+          }),
+          plannedChunks: 0,
+        },
+      );
       return {
         ok: false,
         entries,
@@ -7284,6 +7746,7 @@ Delegation rules:
         if (this.steeringContinuation) break;
         if (
           this.providerRetryInProgress ||
+          this.overflowRecoveryInProgress ||
           this.silentTurnRerunInProgress ||
           this.progressTurnRerunInProgress
         ) {
@@ -7294,6 +7757,7 @@ Delegation rules:
       case "turn_start":
         if (
           this.providerRetryInProgress ||
+          this.overflowRecoveryInProgress ||
           this.silentTurnRerunInProgress ||
           this.progressTurnRerunInProgress
         ) {
@@ -7308,6 +7772,7 @@ Delegation rules:
           const content = assistantContent((event.message as any).content);
           const retryingAssistant =
             this.providerRetryInProgress ||
+            this.overflowRecoveryInProgress ||
             this.silentTurnRerunInProgress ||
             this.progressTurnRerunInProgress
               ? this.currentAssistant
@@ -7315,7 +7780,7 @@ Delegation rules:
           const initialText =
             content.hasText && content.text.length > 0
               ? content.text
-              : this.progressTurnRerunInProgress
+              : this.progressTurnRerunInProgress || this.overflowRecoveryInProgress
                 ? retryingAssistant?.content ?? ""
                 : content.text;
           this.currentAssistant = {
@@ -7336,6 +7801,7 @@ Delegation rules:
             // duplicate error row when the second request succeeds. The same
             // applies to a silent-turn re-run: one bubble, no empty row.
             this.providerRetryInProgress = false;
+            this.overflowRecoveryInProgress = false;
             this.silentTurnRerunInProgress = false;
             this.progressTurnRerunInProgress = false;
             this.emit({ type: "message_update", message: this.currentAssistant });
@@ -7597,6 +8063,33 @@ Delegation rules:
             this.streamStartedAt = undefined;
             break;
           }
+          const canRecoverOverflow =
+            this.compactionEnabled &&
+            overflow &&
+            !this.overflowRecoveryAttempted;
+          if (canRecoverOverflow) {
+            // Keep the failed response inside the same visible assistant bubble
+            // while compaction prepares the retry. A provider overflow is an
+            // internal recovery transition, not a terminal user-facing error.
+            this.currentAssistant = {
+              ...this.currentAssistant,
+              content: nextText,
+              ...(nextThinking
+                ? { thinking: nextThinking }
+                : content.hasThinking
+                  ? { thinking: undefined }
+                  : {}),
+              status: "streaming",
+              modelId: this.provider.modelId,
+              providerId: this.provider.id,
+              ...(usage ? { usage } : {}),
+            };
+            this.emit({ type: "message_update", message: this.currentAssistant });
+            this.streamStartedAt = undefined;
+            this.pendingOverflow = true;
+            this.suppressOverflowRunEnd = true;
+            break;
+          }
           const emptyResponse = silentTurn;
           const diagnosticError = classifiedError;
           const retryProviderAttempt =
@@ -7668,10 +8161,6 @@ Delegation rules:
           this.activeProviderRetryAttempt = 0;
           this.streamStartedAt = undefined;
           this.currentAssistant = undefined;
-          const canRecoverOverflow =
-            this.compactionEnabled &&
-            overflow &&
-            !this.overflowRecoveryAttempted;
           if (exemptSilence) {
             // Accepted silence is still nothing worth resending: keep it out
             // of the runtime entries, exactly as a restored transcript would,
@@ -7688,10 +8177,7 @@ Delegation rules:
           } else {
             this.turnHadError = true;
           }
-          if (canRecoverOverflow) {
-            this.pendingOverflow = true;
-            this.suppressOverflowRunEnd = true;
-          } else if (diagnosticError) {
+          if (diagnosticError) {
             this.terminateParentTurn();
             this.emit({ type: "error", error: diagnosticError });
           }
@@ -7813,6 +8299,10 @@ Delegation rules:
           this.acceptingSteering = false;
           this.retainPendingSteering();
           this.autonomousExecution = false;
+          this.goalReportDraftManager = undefined;
+          this.goalProgressManager = undefined;
+          this.rebuildToolCatalog();
+          this.setAgentTools(this.activeTools());
           this.clearAgentActivity();
           if (outcome.status === "error") {
             this.reportSubmissionTermination(outcome);
@@ -7837,9 +8327,11 @@ Delegation rules:
         this.acceptingSteering = false;
         this.retainPendingSteering();
         this.autonomousExecution = false;
-        if (this.goalReportDraftManager) {
+        if (this.goalReportDraftManager || this.goalProgressManager) {
           this.goalReportDraftManager = undefined;
+          this.goalProgressManager = undefined;
           this.rebuildToolCatalog();
+          this.setAgentTools(this.activeTools());
         }
         this.clearAgentActivity();
         this.reportMutationTermination();
@@ -8023,7 +8515,6 @@ Delegation rules:
     // Claims are message-scoped: a later prompt must observe edited or newly
     // created instruction files instead of reusing a previous chain.
     this.pathInstructionClaims.clear();
-    this.hostTurnId = durableTurnId;
     this.turnId = durableTurnId;
     this.acceptingSteering = true;
     this.pendingUserMessageId = undefined;
@@ -8031,6 +8522,16 @@ Delegation rules:
     this.runCancelled = false;
     this.resetRunRecoveryState();
     this.turnEpoch += 1;
+    const executionTurnEpoch = this.turnEpoch;
+    const ensureExecutionIsCurrent = () => {
+      if (
+        this.disposed ||
+        this.runCancelled ||
+        this.turnEpoch !== executionTurnEpoch
+      ) {
+        throw turnAbortedError("Approved execution was stopped before startup");
+      }
+    };
     this.abortDelegationsFromPreviousTurns();
     this.currentAssistant = undefined;
     this.requestStartedAt = Date.now();
@@ -8038,6 +8539,8 @@ Delegation rules:
     this.autonomousExecution = true;
     // The transcript stays complete, but execution sees only its approved
     // contract and subsequent work, never planning turns from another model.
+    // The system state is transcript rows too, so entriesFromExecutionStart
+    // keeps it.
     this.executionContextStartIndex = this.fullEntries.length;
 
     const kind = execution.kind === "goal" ? "goal" : "plan";
@@ -8075,11 +8578,67 @@ Delegation rules:
           );
         },
       });
+      let tokenRes: unknown;
+      let tokenRequestFailed = false;
+      try {
+        tokenRes = await this.host.call<unknown>("goalProgress.issueToken", {
+          sessionId: execution.sessionId,
+          executionId: execution.id,
+          turnId: durableTurnId,
+        });
+      } catch (error: unknown) {
+        ensureExecutionIsCurrent();
+        tokenRequestFailed = true;
+        this.logGoalProgressTokenFailure(execution.id, error);
+      }
+      ensureExecutionIsCurrent();
+      if (!tokenRequestFailed) {
+        const writeToken =
+          tokenRes !== null && typeof tokenRes === "object" && !Array.isArray(tokenRes)
+            ? (tokenRes as Record<string, unknown>).writeToken
+            : undefined;
+        if (typeof writeToken === "string" && writeToken.trim()) {
+          this.goalProgressManager = new GoalProgressManager({
+            sessionId: execution.sessionId,
+            executionId: execution.id,
+            writeToken,
+            onUpdate: async (items) => {
+              const res = await this.host.call<unknown>("goalProgress.update", {
+                sessionId: execution.sessionId,
+                executionId: execution.id,
+                writeToken,
+                items,
+              });
+              const snapshot =
+                res !== null && typeof res === "object" && !Array.isArray(res)
+                  ? (res as Record<string, unknown>).progress
+                  : undefined;
+              if (
+                !validateGoalProgressSnapshot(snapshot) ||
+                snapshot.sessionId !== execution.sessionId ||
+                snapshot.executionId !== execution.id
+              ) {
+                throw new Error("Host returned an invalid goal progress snapshot");
+              }
+              return snapshot;
+            },
+          });
+        } else {
+          this.logGoalProgressTokenFailure(
+            execution.id,
+            new Error("Host returned no valid write token"),
+          );
+        }
+      }
+      ensureExecutionIsCurrent();
       this.rebuildToolCatalog();
+      this.setAgentTools(this.activeTools());
     } else {
-      if (this.goalReportDraftManager) {
+      if (this.goalReportDraftManager || this.goalProgressManager) {
         this.goalReportDraftManager = undefined;
+        this.goalProgressManager = undefined;
         this.rebuildToolCatalog();
+        this.setAgentTools(this.activeTools());
       }
     }
     const instruction =
@@ -8150,6 +8709,7 @@ Delegation rules:
       });
       return { turnId: this.turnId };
     }
+    ensureExecutionIsCurrent();
     await this.agent.continue();
     await this.waitForIdleAndSteering();
     // Same recovery contract as a user prompt: a plan execution that overflows,
@@ -8176,7 +8736,6 @@ Delegation rules:
       : input;
     this.retainPendingSteering();
     const nextTurnId = durableTurnId?.trim() || randomUUID();
-    this.hostTurnId = nextTurnId;
     this.turnId = nextTurnId;
     this.acceptingSteering = true;
     this.gracefulStopRequested = false;
@@ -8190,8 +8749,9 @@ Delegation rules:
     this.pendingUserMessageId = userMessageId;
     this.resetRunRecoveryState();
     this.autonomousExecution = false;
-    if (this.goalReportDraftManager) {
+    if (this.goalReportDraftManager || this.goalProgressManager) {
       this.goalReportDraftManager = undefined;
+      this.goalProgressManager = undefined;
       this.rebuildToolCatalog();
     }
     // Main resolves this provenance from the Host ledger. Never infer it from
@@ -8261,7 +8821,7 @@ Delegation rules:
       if (typeof modelInput === "string") {
         await this.agent.prompt(modelInput);
       } else {
-        await this.agent.prompt(modelInput.text, promptImages(modelInput));
+        await this.agent.prompt(promptText(modelInput), promptImages(modelInput));
       }
       await this.waitForIdleAndSteering();
       void this.extensionRunner?.emit("agent_settled", { type: "agent_settled" });
@@ -8308,19 +8868,11 @@ Delegation rules:
     }
     if (!runner.hasHandlers("before_agent_start")) return;
     const base = this.composeSystemPrompt();
-    const result = await runner.emit<{ systemPrompt?: string }>(
-      "before_agent_start",
-      {
-        type: "before_agent_start",
-        prompt: typeof input === "string" ? input : input.text,
-        systemPrompt: base,
-        systemPromptOptions: {},
-      },
-      (acc, next) => ({ ...(acc ?? {}), ...next }),
+    const prompt = await runner.emitBeforeAgentStart(
+      typeof input === "string" ? input : input.text,
+      base,
     );
-    this.setAgentSystemPrompt(
-      typeof result?.systemPrompt === "string" ? result.systemPrompt : base,
-    );
+    this.setAgentSystemPrompt(prompt ?? base);
   }
   /**
    * `before_provider_request` rides pi-ai's `onPayload`, `after_provider_response`
@@ -8451,6 +9003,7 @@ Delegation rules:
     this.acceptingSteering = false;
     this.gracefulStopRequested = false;
     this.runCancelled = true;
+    this.clearGoalProgressTool();
     this.steeringWaitAbort?.abort();
     this.extensionRunner?.cancelPending();
     this.resolvePendingAskTools();
@@ -8495,6 +9048,10 @@ Delegation rules:
     this.extensionRunner = undefined;
     const closingExtensions = typeof runner?.dispose === "function" ? runner.dispose() : undefined;
     this.streamSink.dispose();
+    this.goalProgressManager = undefined;
+    this.goalReportDraftManager = undefined;
+    this.rebuildToolCatalog();
+    this.setAgentTools(this.activeTools());
     this.disposed = true;
     this.acceptingSteering = false;
     this.runCancelled = true;

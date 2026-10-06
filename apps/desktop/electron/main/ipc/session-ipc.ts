@@ -9,11 +9,11 @@ import {
   draftMatchesExisting,
   providerCreateInputFromDraft,
   isModelConfigImportSource,
-  type ActivationScope,
   type ModelConfigImportDraft,
   type Mode,
   type SessionThinkingLevel,
 } from "@pi-desktop/shared";
+import type { SessionRenameGuard } from "@pi-desktop/shared";
 import {
   convertSession,
   scanAllSources,
@@ -37,11 +37,6 @@ type RuntimeSession = {
   modelId?: string;
   thinkingLevel?: SessionThinkingLevel;
   [key: string]: unknown;
-};
-
-type ImportableModelConfig = ModelConfigImportDraft & {
-  id?: string;
-  secretValue?: string;
 };
 
 let scannedImportSessions = new Map<string, ExternalSessionSummary>();
@@ -139,6 +134,15 @@ export function registerSessionIpc({
   handle(IPC.invoke.sessionSearchContext, async (input) => {
     if (!host) throw new Error("host unavailable");
     return host.call("search.context", input);
+  });
+  handle(IPC.invoke.todosGet, async (input: { sessionId?: unknown } = {}) => {
+    if (!host) throw new Error("host unavailable");
+    if (typeof input.sessionId !== "string" || !input.sessionId.trim()) {
+      throw Object.assign(new Error("sessionId is required"), {
+        errorCode: ErrorCodes.INVALID_ARGUMENT,
+      });
+    }
+    return host.call("todos.get", { sessionId: input.sessionId });
   });
   handle(IPC.invoke.sessionList, async () => {
     if (!host) throw new Error("host unavailable");
@@ -360,14 +364,48 @@ export function registerSessionIpc({
     logger.app("session", "info", "session deleted", { sessionId: id });
     return res;
   });
-  handle(IPC.invoke.sessionRename, async (id: string, title: string) => {
+  handle(IPC.invoke.sessionRename, async (id: string, title: string, rawGuard?: unknown) => {
+    let guard: SessionRenameGuard | undefined;
+    if (rawGuard !== undefined) {
+      if (!rawGuard || typeof rawGuard !== "object" || Array.isArray(rawGuard)) {
+        throw Object.assign(new Error("Session rename guard is invalid"), {
+          errorCode: ErrorCodes.INVALID_ARGUMENT,
+        });
+      }
+      const expectedTitle = Reflect.get(rawGuard, "expectedTitle");
+      const expectedExecutionId = Reflect.get(rawGuard, "expectedExecutionId");
+      const allowedKeys = new Set(["expectedTitle", "expectedExecutionId"]);
+      if (
+        Object.keys(rawGuard).some((key) => !allowedKeys.has(key)) ||
+        typeof expectedTitle !== "string" ||
+        Array.from(expectedTitle).length > 80 ||
+        (expectedExecutionId !== undefined &&
+          expectedExecutionId !== null &&
+          (typeof expectedExecutionId !== "string" ||
+            !expectedExecutionId.trim() ||
+            Array.from(expectedExecutionId).length > 256))
+      ) {
+        throw Object.assign(new Error("Session rename guard is invalid"), {
+          errorCode: ErrorCodes.INVALID_ARGUMENT,
+        });
+      }
+      guard = {
+        expectedTitle,
+        ...(expectedExecutionId !== undefined ? { expectedExecutionId } : {}),
+      };
+    }
     if (id.startsWith("native-pi:")) {
       throw Object.assign(new Error("Native Pi session rename is not supported"), {
         errorCode: ErrorCodes.INVALID_ARGUMENT,
       });
     }
+    if (guard && id.startsWith("remote:")) {
+      throw Object.assign(new Error("Guarded session rename is not supported for remote sessions"), {
+        errorCode: ErrorCodes.INVALID_ARGUMENT,
+      });
+    }
     if (!host) throw new Error("host unavailable");
-    return host.call("session.rename", { id, title });
+    return host.call("session.rename", { id, title, ...(guard ?? {}) });
   });
   handle(
     IPC.invoke.sessionMoveProject,

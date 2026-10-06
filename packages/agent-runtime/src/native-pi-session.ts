@@ -45,8 +45,9 @@ import {
   nativePiSnapshot,
   type NativePiSnapshot,
 } from "./native-pi-session-lease.js";
+import { NATIVE_PI_SESSION_PREFIX } from "./native-pi-session-id.js";
 
-export const NATIVE_PI_SESSION_PREFIX = "native-pi:";
+export { NATIVE_PI_SESSION_PREFIX };
 
 export type NativePiReadOnlyReason =
   | "busy"
@@ -337,6 +338,10 @@ class NativePiRuntime {
     return this.turnId !== undefined;
   }
 
+  get currentTurnId(): string | undefined {
+    return this.turnId;
+  }
+
   async prompt(content: string, turnId: string, userMessageId?: string): Promise<void> {
     if (this.isRunning) {
       throw Object.assign(new Error("session already has an active turn"), { errorCode: "AGENT_BUSY" });
@@ -375,8 +380,10 @@ class NativePiRuntime {
     this.notify({ sessionId: this.id, turnId, ts: Date.now(), event: { type: "agent_end", messageIds: [] } });
   }
 
-  async abort(): Promise<void> {
+  async abort(expectedTurnId?: string): Promise<boolean> {
+    if (!this.turnId || (expectedTurnId !== undefined && this.turnId !== expectedTurnId)) return false;
     await this.session.abort();
+    return true;
   }
 
   dispose(): void {
@@ -540,7 +547,30 @@ export class NativePiSessionService {
         }
       }),
     );
-    return summaries
+    // A copied session file (backup, manual copy) under the scan root must
+    // not become a second session: identity follows the header id, not the
+    // path. Keep the newest write per native id and drop the stale copies
+    // from the records map so lookups cannot route to a dead duplicate
+    // (#1359).
+    const seenNativeIds = new Set<string>();
+    const deduped: Array<SessionSummary | undefined> = [];
+    const sortedByRecency = [...summaries].sort((a, b) =>
+      (b?.updatedAt ?? "").localeCompare(a?.updatedAt ?? ""),
+    );
+    const winnerIds = new Set<string>();
+    for (const summary of sortedByRecency) {
+      if (!summary) continue;
+      const record = this.records.get(summary.id);
+      if (!record) continue;
+      if (seenNativeIds.has(record.nativeId)) {
+        this.records.delete(summary.id);
+        continue;
+      }
+      seenNativeIds.add(record.nativeId);
+      winnerIds.add(summary.id);
+    }
+    deduped.push(...summaries.filter((summary) => summary && winnerIds.has(summary.id)));
+    return deduped
       .filter((session): session is SessionSummary => Boolean(session))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
@@ -958,19 +988,22 @@ export class NativePiSessionService {
     return { accepted: true, turnId };
   }
 
-  status(id: string): { status: { sessionId: string; isRunning: boolean; pendingToolConfirmations: number } } {
+  status(id: string): { status: { sessionId: string; isRunning: boolean; pendingToolConfirmations: number; currentTurnId?: string } } {
+    const runtime = this.runtimes.get(id);
     return {
       status: {
         sessionId: id,
-        isRunning: this.runtimes.get(id)?.isRunning ?? false,
+        isRunning: runtime?.isRunning ?? false,
+        ...(runtime?.currentTurnId ? { currentTurnId: runtime.currentTurnId } : {}),
         pendingToolConfirmations: 0,
       },
     };
   }
 
-  async abort(id: string): Promise<{ ok: boolean }> {
-    await this.runtimes.get(id)?.abort();
-    return { ok: true };
+  async abort(id: string, expectedTurnId?: string): Promise<{ ok: boolean }> {
+    const runtime = this.runtimes.get(id);
+    if (!runtime) return { ok: false };
+    return { ok: await runtime.abort(expectedTurnId) };
   }
 
   dispose(id: string): void {

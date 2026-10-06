@@ -23,6 +23,17 @@ export type SessionCapabilities = {
   canRefresh: boolean;
 };
 
+export type SessionTeamRelation = {
+  teamSessionId: string;
+  role: "lead" | "member";
+  memberName?: string;
+};
+
+export type SessionRenameGuard = {
+  expectedTitle: string;
+  expectedExecutionId?: string | null;
+};
+
 export type SessionSummary = {
   id: string;
   /** Transcript authority. Omitted by older hosts and normalized to `desktop`. */
@@ -50,11 +61,20 @@ export type SessionSummary = {
   permissionMode: PermissionMode;
   /** Execution profile: standard single agent or team lead. Defaults to `standard`. */
   executionProfile?: ExecutionProfile;
+  /** Host-derived parent/member relationship for sidebar grouping. */
+  team?: SessionTeamRelation;
   /** Effective capability for this session's exact provider/model pair. */
   supportsReasoning?: boolean;
   /** Effective image-input capability for this session's exact model. */
   supportsVision?: boolean;
   supportedThinkingLevels?: ThinkingLevel[];
+  /**
+   * True when this session is the transcript owned by a scheduled-task run.
+   * The automation owns it: the SessionList and global session search hide it,
+   * and the Scheduled page is its entry point (`todos`-style automation output).
+   * Older hosts omit it, so `undefined` means an ordinary conversation.
+   */
+  scheduledRun?: boolean;
   updatedAt: string;
   createdAt: string;
 };

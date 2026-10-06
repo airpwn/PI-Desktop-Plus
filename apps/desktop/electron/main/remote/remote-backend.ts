@@ -18,6 +18,7 @@ import type {
   AgentQueuePushRequest,
   AgentStatus,
   AgentStopResponse,
+  GoalProgressSnapshot,
   AskToolResolution,
   PlanResolutionResult,
   PlanResolveRequest,
@@ -66,6 +67,7 @@ const HANDLED_CHANNELS: ReadonlySet<string> = new Set([
   IPC.invoke.agentPrompt,
   IPC.invoke.agentQueuePush,
   IPC.invoke.agentQueueList,
+  IPC.invoke.agentQueueRemove,
   IPC.invoke.agentStop,
   IPC.invoke.agentAbort,
   IPC.invoke.agentCompact,
@@ -86,6 +88,7 @@ const HANDLED_CHANNELS: ReadonlySet<string> = new Set([
   IPC.invoke.goalReportGet,
   IPC.invoke.goalReportList,
   IPC.invoke.goalReportRetry,
+  IPC.invoke.goalProgressGet,
 ]);
 
 export function createRemoteBackend(options: RemoteBackendOptions): RemoteBackend {
@@ -182,6 +185,15 @@ export function createRemoteBackend(options: RemoteBackendOptions): RemoteBacken
           position: turn.queuePosition ?? 0,
           createdAt: new Date().toISOString(),
         } satisfies QueuedTurnSummary;
+      }
+      case IPC.invoke.agentQueueRemove: {
+        const request = args[0] as { turnId?: unknown };
+        const turnId = typeof request.turnId === "string" ? request.turnId.trim() : "";
+        if (!turnId || turnId.length > 256) {
+          throw Object.assign(new Error("queued turn id is invalid"), { errorCode: ErrorCodes.INVALID_ARGUMENT });
+        }
+        await client.request("turn/cancel", { turnId, context: context() });
+        return { ok: true };
       }
       case IPC.invoke.agentQueueList: {
         const remoteSessionId = remoteIdFor(args);
@@ -343,6 +355,35 @@ export function createRemoteBackend(options: RemoteBackendOptions): RemoteBacken
           sessionId: hostSessionId,
           executionId: req.executionId,
         });
+      }
+      case IPC.invoke.goalReportGetAsset: {
+        const req = args[0] as {
+          sessionId: string;
+          executionId: string;
+          screenshotId: string;
+          offset?: number;
+          length?: number;
+        };
+        const hostSessionId = parseRemoteSessionId(req.sessionId)?.hostSessionId ?? hostIdFor(args);
+        return client.request("goalReports/getAsset", {
+          sessionId: hostSessionId,
+          executionId: req.executionId,
+          screenshotId: req.screenshotId,
+          ...(typeof req.offset === "number" ? { offset: req.offset } : {}),
+          ...(typeof req.length === "number" ? { length: req.length } : {}),
+        });
+      }
+      case IPC.invoke.goalProgressGet: {
+        const req = args[0] as { sessionId: string; executionId: string };
+        const result = await client.request<{ progress: GoalProgressSnapshot | null }>("goalProgress/get", {
+          sessionId: hostIdFor(args),
+          executionId: req.executionId,
+        });
+        return {
+          progress: result.progress
+            ? { ...result.progress, sessionId: req.sessionId }
+            : null,
+        };
       }
       case IPC.invoke.plansResolve: {
         const resolution = args[0] as PlanResolveRequest;

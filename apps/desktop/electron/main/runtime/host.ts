@@ -1,4 +1,4 @@
-import { ErrorCodes, IPC, type AgentEventEnvelope, type PlanExecutionFinishStatus, type Risk } from "@pi-desktop/shared";
+import { ErrorCodes, IPC, type AgentEventEnvelope, type GoalProgressChangedEvent, type PlanExecutionFinishStatus, type Risk } from "@pi-desktop/shared";
 import { assertLinuxGlibcSupported } from "../linux-glibc";
 import { HostProcess } from "../host-process";
 import type { Logger } from "../logger";
@@ -134,6 +134,9 @@ export function createHostRuntime({
             ...(asking?.agentName ? { agentName: asking.agentName } : {}),
             ...(asking?.parentToolCallId
               ? { parentToolCallId: asking.parentToolCallId }
+              : {}),
+            ...(asking?.nestedParentToolCallId
+              ? { nestedParentToolCallId: asking.nestedParentToolCallId }
               : {}),
           },
         },
@@ -308,6 +311,15 @@ export function createHostRuntime({
       sendToRenderer(IPC.event.plansChanged, params);
     } else if (method === "goalReports.changed") {
       sendToRenderer(IPC.event.goalReportChanged, params);
+    } else if (method === "goalProgress.changed") {
+      if (isGoalProgressChangedEvent(params)) {
+        runtimeState.agentHostBridge?.agentHost.publishGoalProgressChanged(params);
+      }
+      sendToRenderer(IPC.event.goalProgressChanged, params);
+    } else if (method === "team.changed") {
+      sendToRenderer(IPC.event.teamChanged, params);
+    } else if (method === "todos.changed") {
+      sendToRenderer(IPC.event.todosChanged, params);
     } else if (method === "configSync.changed") {
       sendToRenderer(IPC.event.configSyncChanged, params);
     } else if (method === "configSync.progress") {
@@ -401,4 +413,12 @@ export function createHostRuntime({
   }
   };
   return { wireHost, startHost };
+}
+
+function isGoalProgressChangedEvent(value: unknown): value is GoalProgressChangedEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const event = value as Record<string, unknown>;
+  return typeof event.sessionId === "string" && Boolean(event.sessionId.trim()) &&
+    typeof event.executionId === "string" && Boolean(event.executionId.trim()) &&
+    typeof event.revision === "number" && Number.isInteger(event.revision) && event.revision > 0;
 }

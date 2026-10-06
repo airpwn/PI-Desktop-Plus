@@ -1,4 +1,6 @@
-import { Button, TooltipButton, cx } from "../../components/ui";
+import type { ReactNode } from "react";
+import { Button, TooltipButton, cx, portalOverlay } from "../../components/ui";
+import { useBlockingOverlay } from "../../lib/blocking-overlay";
 import {
   IconCheck,
   IconLink,
@@ -22,9 +24,16 @@ import {
 } from "./model";
 import type { PluginsPageModel } from "./usePluginsPage";
 
+function PluginDetailBlockingHost({ children }: { children: ReactNode }) {
+  useBlockingOverlay();
+  return <>{children}</>;
+}
+
 export function PluginDetailSheet({
   t,
   locale,
+  settings,
+  marketSource,
   selectedId,
   closeDetail,
   detail,
@@ -40,8 +49,9 @@ export function PluginDetailSheet({
   queueInstall,
   setSelectedVersion,
 }: PluginsPageModel) {
-  return (
-    selectedId ? (
+  return selectedId
+    ? portalOverlay(
+        <PluginDetailBlockingHost>
         <div className="plugins-sheet-layer">
           <button
             type="button"
@@ -139,6 +149,14 @@ export function PluginDetailSheet({
                           name: detail.name,
                           version: installTarget,
                           permissions: detailPermissions,
+                          expectedMarketplace: activeVersion?.shasum
+                            ? {
+                                source: settings?.pluginMarketSource ?? "official",
+                                catalogUrl: marketSource,
+                                version: activeVersion.version,
+                                shasum: activeVersion.shasum,
+                              }
+                            : undefined,
                         })
                       }
                     >
@@ -354,7 +372,7 @@ export function PluginDetailSheet({
             )}
           </aside>
         </div>
-
-    ) : null
-  );
+        </PluginDetailBlockingHost>,
+      )
+    : null;
 }

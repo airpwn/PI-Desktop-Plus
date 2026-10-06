@@ -281,6 +281,13 @@ type ToolBudgetHealth = {
   持久化一条 Team 来源的消息并发出 `team.messageQueued`。立即响应报告邮箱状态，不代表投递
   已完成。Host 会解析发送者的有效权限模式（`inherit` 按当前默认权限解析）并保存为消息
   上限；接收会话的 `session.beginTurn` 在启动回合前必须符合该上限。
+
+`wait_for_updates` 先订阅再读取基线，收到同一 Team 的 `team.changed` /
+`team.messageQueued` 通知后防抖 100 ms 复查。通知可用时每 5 s 兜底复查，
+Host 无通知 API 时仍每 1 s 复查。基线失败返回工具错误；复查失败继续重试，
+截止前没有成功复查则返回最后的错误。取消立即返回，所有退出路径清除订阅、
+定时器和取消监听。变更原因与正常超时判定保持不变。
+
 - `team.ackMessage({ teamSessionId, ackSessionId, messageId })` 仅接受目标成员的确认，并要求
   Host 队列或 turn 回执已持久化。重复确认是幂等的；回合获准启动后，任一会话的权限设置
   变化都不会单独否定已持久化的回执。
@@ -366,6 +373,20 @@ ids 和非负 `tokensBefore`；它不会插入 message/search 行
 工具值会清理主机保留键。每个插件每 60 秒最多 10 次单条导入、5 次批量导入和
 20 次删除。P2/P3 方法不在协议 v11 中。
 
+**会话 Todo 清单**
+- `todos.get({ sessionId })` 返回活动 Desktop 会话已提交的完整清单快照：
+  `{ sessionId, todos, revision, updatedAt }`。未知或软删除会话返回 `NOT_FOUND`；
+  原生 Pi 会话和空 id 返回 `INVALID_ARGUMENT`。
+- `tools.execute` 的 `toolName: "TodoWrite"` 只接受 `{ todos }`，并替换整个有序清单。
+  主机会裁剪内容、将 priority 默认设为 `medium`，把超长 Unicode 内容限制在 500 个字符并
+  返回警告，把后续 `in_progress` 降级为 `pending`，并拒绝超过 50 项或格式错误的值。
+  所属 session 和运行中的 turn 来自可信传输字段，不来自工具参数。
+- TodoWrite 只允许 Agent 会话自己的运行 turn。Plan/Goal、委托、插件和 MCP 调用会返回工具错误，
+  不会修改存储。成功替换即使 `todos` 为空也会推进 revision，并且只在事务提交后发出
+  `todos.changed`；事件负载与 `todos.get` 返回的完整快照一致。
+- SQLite 只由 host-core 拥有。渲染器通过 Electron Main IPC 接收快照，按 session id 保存并忽略
+  更旧或相同 revision。远程 RACP 会话在这条垂直切片中保持 local-only，因为 RACP v1 尚无 Todo 快照操作。
+
 ### Plan 和 Goal 状态和批准
 
 两种合约类型共享这些方法；可选的 `kind`
@@ -385,6 +406,27 @@ ids 和非负 `tokensBefore`；它不会插入 message/search 行
   终端卡
 - `plans.resolve` — 验证一个匹配的 approve/reject 响应，并且
   批准，提交所选权限模式和 `execution_state = queued`
+
+- `plans.dueSchedules({ nowMs? })` 返回 `{ schedules, nextDueAt }`：
+  未明确传入 `nowMs` 时，扫描、claim 和恢复操作在拿到 Host 状态锁后才读取时间，
+  锁等待不会延长自动执行宽限。
+  查询前 Host 原子地把超出 120000 ms 宽限的计划标为 missed，并对每个新转变
+  的 proposal 发送一次 `plans.changed`。`schedules` 包含在 `nowMs` 或之前到期、
+  且仍在宽限内（包含 120000 ms 边界）的合格计划；`nextDueAt` 是最早的未来
+  合格到期时间（epoch ms），无计划时为 `null`。两者只包含 scheduled、approved
+  且无 execution state 的快照。新增响应字段不需要数据库迁移。
+- Main 启动时立即查询，再按下次到期时间唤醒，间隔限制为 1–30 s，无计划时
+  为 30 s；`nextDueAt` 缺失、非数字或非有限值时也使用 30 s。
+  `plans.changed` 和系统 resume 触发 200 ms 防抖唤醒。查询单飞；
+  查询期间的唤醒要求结束后再查一次。Host/sidecar 未就绪、Host 错误和非 busy
+  claim 失败在 5 s 后重试。busy 仍标为 missed。停止及 Host 重启清理订阅和
+  定时器；重启保留 stop → mark missed → drain → start 顺序。运行中睡眠跨过
+  到期时间后，仅在两分钟宽限内（包含边界）可以自动 claim；超过宽限需用户
+  确认立即运行。claim 会再次检查宽限，超出时原子标为 missed、发送
+  `plans.changed` 并返回 `PLAN_SCHEDULE_MISSED`，不创建执行。明确的立即运行
+  （`allowMissed: true`）绕过自动宽限。启动及重启仍把所有到期计划标为 missed，
+  不适用宽限。
+
 - `plans.queuedExecutions` / `plans.claimExecution` /
 `plans.finishExecution` — 消耗并转换执行字段
   同一审批行；声明的执行报告其 `kind`，因此 sidecar 可以
@@ -611,7 +653,7 @@ type ToolsExecuteParams = {
 对于`Read`/`Glob`/`Grep`/`Write`/`Edit`，主机分类显式路径
 在工作区之外并在低风险自动允许规则之前从头开始。
 `auto` 执行它，而 `ask` 和 `accept-edits` 发出
-`permissions.request`；拒绝、超时或取消返回 `TOOL_DENIED`
+`permissions.request`；拒绝或取消返回 `TOOL_DENIED`
 而不执行该操作。相对 `..` 和符号链接转义使用
 相同的分类。 Bash 的工作目录和隐式递归遍历
 不继承这个异常。
@@ -873,7 +915,6 @@ params: {
   risk: "low" | "medium" | "high"
   argsPreview: unknown
   reason: string
-  timeoutMs: 120000
 }
 ```
 
@@ -887,12 +928,11 @@ params: {
 }
 ```
 
-超时行为 (**D005**)：120 秒后未解决 → 拒绝。
+本地权限行为（**D636 / ADR 0310**）：未解决的请求会一直保持待处理，直到明确决定、取消或主机/进程关闭。`tools.execute` 的传输不设置截止时间；批准后仍执行工具自身的超时限制。
 
 `permissions.pending` 把待处理请求作为 Host 状态返回（D374/D375）：
 `{ requests: PendingPermission[] }`，最早的在前，可按 `sessionId` 过滤。每一项包含与
-`permissions.request` 通知相同的字段，外加 `createdAt`、`expiresAt` 和 `remainingMs`；
-已超时的请求不会出现。在通知发出之后才接入的客户端读取此列表，并通过不变的
+`permissions.request` 通知相同的字段，外加 `createdAt`；请求解决前会一直列出。在通知发出之后才接入的客户端读取此列表，并通过不变的
 `permissions.resolve` 作答；通知路径本身不变。
 
 ## 7. 错误代码
@@ -983,7 +1023,7 @@ JSON-RPC 错误携带一个数字 `code` 以及 `data.errorCode`，后者是来�
 1. Electron 生成主机并完成握手
 2.health方法返回ok
 3. 拒绝刀具路径返回 `TOOL_DENIED`
-4.超时路径120s后返回拒绝决策
+4. 未解决的权限请求会一直保持待处理，直到明确决定或取消
 5.将选定的工作空间从A切换到B不会改变工具根
    会话 A 发出的呼叫的
 6. 协议 v4 `session.endTurn` creates/returns 恰好有一个通知

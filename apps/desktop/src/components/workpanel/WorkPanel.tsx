@@ -10,6 +10,7 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import { useBlockingOverlayActive } from "../../lib/blocking-overlay";
+import { localTeamSessionId } from "../../lib/team-presentation";
 import {
   workPanelTabReorderScrollDelta,
   workPanelTabReorderInsertAfter,
@@ -116,6 +117,7 @@ function tabLabel(
   pluginViews: PluginViewMeta[],
 ) {
   if (tab.kind === "plugin") {
+    if (tab.resource === "pi.browser/browser" && tab.label) return tab.label;
     const view = pluginViews.find((candidate) => candidate.ref === tab.resource);
     // A view whose plugin was disabled mid-session no longer resolves; fall
     // back to its id rather than leaving the tab blank until it closes.
@@ -239,11 +241,12 @@ export function WorkPanel({
     displayTabs.find((tab) => tab.id === activeTabId) ??
     (activeSessionId ? displayTabs[0] ?? null : null);
   const activeSession = sessions.find((s) => s.id === activeSessionId);
+  const activeTeamId = localTeamSessionId(activeSession);
   const tools = workPanelTools(
     t,
     pluginViews,
-    activeSession?.executionProfile === "team",
-    activeSessionId ?? undefined,
+    Boolean(activeTeamId),
+    activeTeamId,
   );
   const tabSignature = JSON.stringify(
     tabs.map(({ id, kind, resource, location }) => [id, kind, resource, location]),
@@ -1001,6 +1004,10 @@ export function WorkPanel({
             >
               <TeamPanel
                 teamSessionId={activeTab.resource ?? activeSessionId ?? ""}
+                initialView={activeTab.teamTarget?.kind === "member" ? undefined : activeTab.teamTarget?.kind}
+                initialTaskId={activeTab.teamTarget?.taskId}
+                initialMemberSessionId={activeTab.teamTarget?.kind === "member" ? activeTab.teamTarget.memberSessionId : undefined}
+                navigationSeq={activeTab.teamNavigationSeq}
                 onSelectSession={(sessionId: string) => void selectSession(sessionId)}
               />
             </div>
@@ -1045,6 +1052,7 @@ export function WorkPanel({
                     icon={activePluginView?.icon}
                     sessionId={activeSessionId ?? undefined}
                     location={activeTab.location}
+                    tabId={activeTab.id}
                     // Native WebContentsViews composite above renderer content.
                     blocked={exiting || panelBlocked || blockingOverlayActive}
                   />

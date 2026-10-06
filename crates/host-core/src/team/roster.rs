@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use rusqlite::params;
+use rusqlite::{params, Connection, OptionalExtension};
 
 use super::model::{TeamMember, MAX_TEAM_MEMBERS};
 use crate::db::{now_ms, Database};
@@ -64,6 +64,14 @@ pub fn validate_member_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn is_valid_member_error(error: &str) -> bool {
+    !error.is_empty()
+        && error.len() <= 64
+        && error
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+}
+
 pub fn list_team_members(db: &Database, team_session_id: &str) -> Result<Vec<TeamMember>> {
     let mut stmt = db.conn().prepare_cached(
         "SELECT team_session_id, member_session_id, name, description, context_kind,
@@ -83,6 +91,7 @@ pub fn list_team_members(db: &Database, team_session_id: &str) -> Result<Vec<Tea
                 phase: row.get(5)?,
                 model_id: row.get(6)?,
                 provider_id: row.get(7)?,
+                presentation: None,
                 error: row.get(8)?,
                 created_at: row.get::<_, i64>(9)?.to_string(),
                 updated_at: row.get::<_, i64>(10)?.to_string(),
@@ -114,6 +123,7 @@ pub fn get_team_member_by_name(
             phase: row.get(5)?,
             model_id: row.get(6)?,
             provider_id: row.get(7)?,
+            presentation: None,
             error: row.get(8)?,
             created_at: row.get::<_, i64>(9)?.to_string(),
             updated_at: row.get::<_, i64>(10)?.to_string(),
@@ -144,6 +154,7 @@ pub fn get_team_member_by_session_id(
             phase: row.get(5)?,
             model_id: row.get(6)?,
             provider_id: row.get(7)?,
+            presentation: None,
             error: row.get(8)?,
             created_at: row.get::<_, i64>(9)?.to_string(),
             updated_at: row.get::<_, i64>(10)?.to_string(),
@@ -164,6 +175,21 @@ pub struct CreateMemberParams<'a> {
 }
 
 pub fn create_team_member(db: &Database, params: CreateMemberParams<'_>) -> Result<TeamMember> {
+    create_team_member_impl(db, params, true)
+}
+
+pub(super) fn create_approved_team_member(
+    db: &Database,
+    params: CreateMemberParams<'_>,
+) -> Result<TeamMember> {
+    create_team_member_impl(db, params, false)
+}
+
+fn create_team_member_impl(
+    db: &Database,
+    params: CreateMemberParams<'_>,
+    require_approval: bool,
+) -> Result<TeamMember> {
     let CreateMemberParams {
         team_session_id,
         caller_session_id,
@@ -182,6 +208,11 @@ pub fn create_team_member(db: &Database, params: CreateMemberParams<'_>) -> Resu
     }
 
     validate_team_lead(db, team_session_id)?;
+    if require_approval {
+        return Err(anyhow!(
+            "TEAM_APPROVAL_REQUIRED: teammate creation requires a confirmed launch review"
+        ));
+    }
 
     validate_member_name(name)?;
     let context_kind = context_kind.unwrap_or("fresh");
@@ -255,34 +286,50 @@ pub fn create_team_member(db: &Database, params: CreateMemberParams<'_>) -> Resu
     };
 
     // 6. Ensure team row exists, then insert member and increment team revision
-    db.conn().execute(
-        "INSERT INTO teams (team_session_id, revision, paused, created_at, updated_at)
-         VALUES (?1, 1, 0, ?2, ?2)
-         ON CONFLICT(team_session_id) DO UPDATE SET updated_at = excluded.updated_at",
-        params![team_session_id, now],
-    )?;
-
-    db.conn().execute(
-        "INSERT INTO team_members (
-            team_session_id, member_session_id, name, description, context_kind,
-            phase, model_id, provider_id, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 'idle', ?6, ?7, ?8, ?8)",
-        params![
-            team_session_id,
-            member_session_id,
-            name,
-            description,
-            context_kind,
-            model_id,
-            provider_id,
-            now
-        ],
-    )?;
-
-    db.conn().execute(
-        "UPDATE teams SET revision = revision + 1, updated_at = ?2 WHERE team_session_id = ?1",
-        params![team_session_id, now],
-    )?;
+    let roster_result = sessions::with_savepoint(db.conn(), "team_roster", |conn| {
+        conn.execute(
+            "INSERT INTO teams (team_session_id, revision, paused, created_at, updated_at)
+             VALUES (?1, 1, 0, ?2, ?2)
+             ON CONFLICT(team_session_id) DO UPDATE SET updated_at = excluded.updated_at",
+            params![team_session_id, now],
+        )?;
+        conn.execute(
+            "INSERT INTO team_members (
+                team_session_id, member_session_id, name, description, context_kind,
+                phase, model_id, provider_id, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'idle', ?6, ?7, ?8, ?8)",
+            params![
+                team_session_id,
+                member_session_id,
+                name,
+                description,
+                context_kind,
+                model_id,
+                provider_id,
+                now
+            ],
+        )?;
+        conn.execute(
+            "UPDATE teams SET revision = revision + 1, updated_at = ?2 WHERE team_session_id = ?1",
+            params![team_session_id, now],
+        )?;
+        Ok(())
+    });
+    if let Err(error) = roster_result {
+        if let Err(rollback_error) = sessions::delete_session(db, &member_session_id) {
+            return Err(anyhow!(
+                "{error}; member session cleanup failed: {rollback_error}"
+            ));
+        }
+        if let Err(rollback_error) =
+            sessions::cleanup_uncommitted_team_session_files(db, &member_session_id)
+        {
+            return Err(anyhow!(
+                "{error}; member file cleanup failed: {rollback_error}"
+            ));
+        }
+        return Err(error);
+    }
 
     Ok(TeamMember {
         team_session_id: team_session_id.to_string(),
@@ -293,6 +340,7 @@ pub fn create_team_member(db: &Database, params: CreateMemberParams<'_>) -> Resu
         phase: "idle".to_string(),
         model_id: model_id.map(Into::into),
         provider_id: provider_id.map(Into::into),
+        presentation: None,
         error: None,
         created_at: now.to_string(),
         updated_at: now.to_string(),
@@ -311,6 +359,9 @@ pub fn update_member_phase(
     if !valid_phases.contains(&phase) {
         return Err(anyhow!("INVALID_PARAMS: unknown member phase '{phase}'"));
     }
+    if error.is_some_and(|value| !is_valid_member_error(value)) {
+        return Err(anyhow!("INVALID_PARAMS: invalid member error code"));
+    }
     let now = now_ms();
     let rows = db.conn().execute(
         "UPDATE team_members
@@ -327,4 +378,159 @@ pub fn update_member_phase(
     } else {
         Ok(false)
     }
+}
+
+pub(crate) fn update_member_turn_phase_conn(
+    conn: &Connection,
+    member_session_id: &str,
+    phase: &str,
+    error: Option<&str>,
+) -> Result<bool> {
+    let valid_phases = ["running", "idle", "failed", "completed"];
+    if !valid_phases.contains(&phase) {
+        return Err(anyhow!("INVALID_PARAMS: unknown member phase '{phase}'"));
+    }
+    let error = error.map(|code| {
+        if is_valid_member_error(code) {
+            code
+        } else {
+            "TURN_FAILED"
+        }
+    });
+    let now = now_ms();
+    let team_session_id: Option<String> = conn
+        .query_row(
+            "SELECT team_session_id FROM team_members WHERE member_session_id=?1",
+            params![member_session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(team_session_id) = team_session_id else {
+        let changed = conn.execute(
+            "UPDATE teams SET revision=revision+1, updated_at=?2 WHERE team_session_id=?1",
+            params![member_session_id, now],
+        )?;
+        return Ok(changed > 0);
+    };
+    let changed = conn.execute(
+        "UPDATE team_members SET phase=?1, error=?2, updated_at=?3
+         WHERE member_session_id=?4 AND (phase IS NOT ?1 OR error IS NOT ?2)",
+        params![phase, error, now, member_session_id],
+    )?;
+    if changed > 0 {
+        conn.execute(
+            "UPDATE teams SET revision=revision+1, updated_at=?2 WHERE team_session_id=?1",
+            params![team_session_id, now],
+        )?;
+    }
+    Ok(changed > 0)
+}
+
+pub fn gate_session_configure(
+    db: &Database,
+    session_id: &str,
+    target_mode: &str,
+    target_provider_id: Option<&str>,
+    target_model_id: Option<&str>,
+    target_thinking_level: Option<&str>,
+    target_permission_mode: Option<&str>,
+    target_execution_profile: Option<&str>,
+) -> Result<()> {
+    let member = get_team_member_by_session_id(db, session_id)?;
+    if member.is_none()
+        && target_execution_profile == Some("standard")
+        && sessions::session_execution_profile(db, session_id)?.as_deref() == Some("team")
+    {
+        let has_members_or_tasks: bool = db.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_session_id=?1)
+                OR EXISTS(SELECT 1 FROM team_tasks WHERE team_session_id=?1)",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        let has_mail: bool = db.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_collaboration_messages
+                 WHERE plugin_id=?1)",
+            [super::mailbox::team_plugin_origin(session_id)],
+            |row| row.get(0),
+        )?;
+        let has_review_data: bool = db.conn().query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM kv
+                 WHERE ns IN ('team-launch-review-v1','team-execution-decision-v1')
+                   AND (key=?1 OR key LIKE ?2)
+             )",
+            params![session_id, format!("{session_id}:%")],
+            |row| row.get(0),
+        )?;
+        if has_members_or_tasks || has_mail || has_review_data {
+            return Err(anyhow!(
+                "TEAM_LEAD_CONFIGURATION_BLOCKED: cannot change execution profile while Team data exists"
+            ));
+        }
+    }
+
+    if let Some(member) = member {
+        if target_mode != "agent" {
+            return Err(anyhow!(
+                "TEAM_MEMBER_MODEL_CHANGE_BLOCKED: cannot change mode of active team member"
+            ));
+        }
+        if let Some(profile) = target_execution_profile {
+            if profile != "team" {
+                return Err(anyhow!(
+                    "TEAM_MEMBER_MODEL_CHANGE_BLOCKED: cannot change execution profile of active team member"
+                ));
+            }
+        }
+        let detail = sessions::get_session(db, session_id)?
+            .ok_or_else(|| anyhow!("TEAM_NOT_FOUND: member session not found"))?;
+        if target_permission_mode
+            .is_some_and(|permission| permission != detail.summary.permission_mode)
+        {
+            return Err(anyhow!(
+                "TEAM_MEMBER_MODEL_CHANGE_BLOCKED: cannot change permission mode of active team member"
+            ));
+        }
+
+        if member.phase != "idle" {
+            return Err(anyhow!(
+                "TEAM_MEMBER_MODEL_CHANGE_BLOCKED: cannot configure team member while in '{}' phase",
+                member.phase
+            ));
+        }
+
+        let queued_count: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM session_collaboration_messages
+             WHERE plugin_id = ?1 AND target_session_id = ?2 AND status = 'queued'",
+            params![
+                super::mailbox::team_plugin_origin(&member.team_session_id),
+                session_id
+            ],
+            |row| row.get(0),
+        )?;
+        if queued_count > 0 {
+            return Err(anyhow!(
+                "TEAM_MEMBER_MODEL_CHANGE_BLOCKED: cannot configure team member with pending queued messages"
+            ));
+        }
+
+        if super::review::has_pending_review_for_member(db, &member.team_session_id, &member.name)?
+        {
+            return Err(anyhow!(
+                "TEAM_MEMBER_MODEL_CHANGE_BLOCKED: cannot configure team member under pending launch review"
+            ));
+        }
+
+        let provider_id = target_provider_id
+            .map(str::to_string)
+            .or(detail.summary.provider_id)
+            .ok_or_else(|| anyhow!("TEAM_MODEL_SELECTION_INVALID: member has no provider"))?;
+        let model_id = target_model_id
+            .map(str::to_string)
+            .or(detail.summary.model_id)
+            .ok_or_else(|| anyhow!("TEAM_MODEL_SELECTION_INVALID: member has no model"))?;
+        let thinking_level = target_thinking_level.unwrap_or(&detail.summary.thinking_level);
+        super::review::validate_member_route(db, &provider_id, &model_id, thinking_level)?;
+    }
+    Ok(())
 }

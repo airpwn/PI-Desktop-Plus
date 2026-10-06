@@ -53,9 +53,14 @@ Permission prompts do not consume an execution slot. A full queue returns
 `HOST_OVERLOADED` with retryable semantics in the tool result instead of
 waiting indefinitely or spawning more work. The limits are host-owned so
 Electron and the sidecar cannot independently over-admit the same resources.
-The per-session mutation permit is acquired before the global mutation slot;
-queued `Write`/`Edit` calls therefore do not hold global capacity while waiting
-for an earlier mutation in the same session.
+Admission reserves total, tool-class, session, and session-mutation capacity
+atomically. A queued call holds no execution capacity. When capacity returns,
+the oldest runnable request is admitted; a request blocked by one class or
+session does not block unrelated runnable work. Calls wait at most 30 seconds.
+Dropping a waiting admission future or letting it time out removes its queue
+entry and releases any reservation made before the caller receives its permit. The health counters report only
+fully admitted reservations, including those awaiting delivery to the caller;
+`queued` counts only requests still waiting for capacity.
 
 Electron's `HostProcess` treats an explicit `HOST_OVERLOADED` response as
 retryable backpressure for renderer-facing calls. It waits 50, 100, 200, and
@@ -176,10 +181,13 @@ creates neither A2A tables nor unowned plugin-session rows. The schema version i
 internal persistence invariant, not an additional JSON-RPC field; the
 checkpoint architecture remains host-owned.
 
-The current host-core storage schema is v22. The v21-to-v22 additive migration
-adds approved execution provider/model bindings, durable revision intent fields,
-and the `plan_execution_schedules` table. Protocol v11 remains the wire
-version; this persistence increment does not add a JSON-RPC version field.
+The shared host-core storage chain is v19. Plus-only structures, including
+approved execution provider/model bindings, durable revision intent fields, and
+the `plan_execution_schedules` table, are versioned by the separate Plus track
+recorded in `plus_schema_meta` (current v4; see the data-storage spec, section
+7.1), so a Plus persistence increment does not move `user_version`. Protocol v11
+remains the wire version; persistence increments on either track do not add a
+JSON-RPC version field.
 
 ## 4. Method catalog (MVP)
 
@@ -222,10 +230,13 @@ type ToolBudgetHealth = {
   every session attached to it, removing those sessions' transcript, scratch,
   and review files and the project's durable memory, and never touching the
   project folder on disk. Idempotent: an unknown path returns
-  `{ removed: false, sessionsRemoved: 0 }`. A path that is a root of a stored
-  multi-folder project group is refused so the group keeps a valid primary root,
-  and the call is refused (1008 / `CONFLICT`) while any attached session has a
-  running turn, so a live turn never loses the transcript it is writing.
+  `{ removed: false, sessionsRemoved: 0 }`. If the path belongs to a stored
+  project group, deletion detaches that root in the same flow; deleting the
+  primary promotes the first remaining root, and deleting the last root also
+  removes the group record. The call is refused (1008 / `CONFLICT`) while any
+  attached session has a running turn, before changing group membership, so a
+  live turn never loses the transcript it is writing and a rejected delete
+  leaves the project group unchanged.
 - `project.memory.get({ path })` — returns the durable memory for the canonical
   project path, or an empty record when no memory has been saved
 - `project.memory.set({ path, entries })` — normalizes and stores visual memory
@@ -373,6 +384,27 @@ to later refresh and inference; the vendor picker does not collect them.
 - `team.getRoster({ teamSessionId, callerSessionId })` and
   `team.getBoard({ teamSessionId, callerSessionId })` return separate roster
   and revisioned task-board projections after Host membership validation.
+- `team.getSnapshot({ teamSessionId, callerSessionId })` is the additive local
+  Desktop read used by Overview, TeamPanel, and the panorama. It returns one
+  flat, revisioned view with members/presentation, Lead phase, tasks/readiness,
+  overlaps, queued Team-mail count, current launch review, and latest execution
+  decision. Review edit/confirm/cancel remain separate trusted operations; the
+  read does not grant mutation authority. Existing roster and board methods
+  remain available to older clients. Remote/native source projections do not
+  call this local IPC surface.
+  Missing legacy Team rows may bootstrap only for an existing local Team Lead;
+  dissolved, standard, deleted and member sessions cannot bootstrap a Team.
+  Lead configuration to `standard` returns `TEAM_LEAD_CONFIGURATION_BLOCKED`
+  while durable Team work exists; deletion failures do not dissolve the Team.
+- After committed Team state changes, `team.changed` carries only
+  `{ teamSessionId, revision, reason }`. Desktop Main forwards it on the typed
+  Team event. A renderer can ignore an older revision and refresh its scoped
+  snapshot; prompts, task descriptions, and transcripts are not event payload.
+- `team.declareStrategy` accepts optional member presentation on proposed
+  review data. It creates or updates a pending review, never a member session.
+  The trusted Desktop review path selects effective member bindings and
+  confirms the revision before Host creation/dispatch. Direct mutation entry
+  points reject unconfirmed work; `spawn_teammate` does not accept presentation.
 - `team.getMessage({ teamSessionId, callerSessionId, messageId })` reads one
   durable Team mailbox row. The Lead can read every row; a member can read only
   a row it sent or received. Unknown and cross-Team ids return `null`.
@@ -388,6 +420,16 @@ to later refresh and inference; the vendor picker does not collect them.
   delivery. Host resolves the sender's effective permission mode (including
   `inherit` against the current default) and stores it as the message ceiling;
   `session.beginTurn` enforces that ceiling before a recipient turn starts.
+
+The `wait_for_updates` tool subscribes before reading its baseline and wakes on
+matching `team.changed` / `team.messageQueued` notifications, debounced for
+100 ms. It rechecks every 5 s as a bounded fallback, or every 1 s when the Host
+has no notification API. Baseline failures return a tool error; recheck failures
+are retried, and a deadline with no successful recheck returns the last error.
+Abort returns immediately. Every exit removes subscriptions, timers and abort
+listeners. Board/message change reasons and successful timeout behavior remain
+unchanged.
+
 - `team.ackMessage({ teamSessionId, ackSessionId, messageId })` accepts only
   the target member and requires a durable Host queue or turn receipt. Repeated
   acknowledgements are idempotent. It does not reject a durable receipt solely
@@ -534,6 +576,28 @@ oversized/deep payloads. Tool values are sanitized for host-reserved keys. The
 per-plugin rolling limits are 10 single imports, 5 batch imports, and 20
 deletes per 60 seconds. P2/P3 methods are not present in protocol v11.
 
+### Session Todo checklist
+
+- `todos.get({ sessionId })` returns the committed checklist snapshot for a live
+  Desktop session: `{ sessionId, todos, revision, updatedAt }`. Unknown or
+  soft-deleted sessions return `NOT_FOUND`; native Pi sessions and blank ids are
+  rejected as `INVALID_ARGUMENT`.
+- `tools.execute` with `toolName: "TodoWrite"` accepts only `{ todos }` and
+  replaces the complete ordered checklist. The host trims content, defaults
+  priority to `medium`, truncates overlong Unicode content at 500 characters
+  with a warning, demotes later `in_progress` items to `pending`, and rejects
+  more than 50 items or malformed values. The owner session and running turn
+  come from the trusted transport fields, never from tool arguments.
+- TodoWrite is allowed only for an Agent session's own running turn. Plan/Goal,
+  delegated, plugin, and MCP calls receive a tool result error and do not mutate
+  storage. A successful replacement advances the session revision even when
+  `todos` is empty and emits `todos.changed` after the transaction commits.
+  The event payload is the same complete snapshot returned by `todos.get`.
+- SQLite ownership is host-core only. The renderer receives snapshots through
+  Electron Main IPC, keeps them by session id, and ignores revisions older than
+  or equal to the cached revision. Remote RACP sessions are local-only for this
+  vertical slice because RACP v1 has no Todo snapshot operation.
+
 ### Stats
 
 - `stats.getTokenUsageHistory` — roll up completed `turns` token columns and
@@ -571,18 +635,61 @@ contract is being negotiated.
 - `plans.claimSchedule` / `plans.cancelSchedule` — atomically claim a due
   schedule (including an explicitly confirmed missed schedule) or cancel a
   scheduled/missed snapshot. A claim is single-use and returns the bound
-  execution descriptor
+  execution descriptor. Automatic claims allow at most 120000 ms after the
+  deadline (inclusive); a later claim atomically marks it missed, emits
+  `plans.changed` and returns `PLAN_SCHEDULE_MISSED` without creating an execution.
+  Explicit Run now (`allowMissed: true`) bypasses that automatic grace window.
 - `plans.markRevisionFailed` — records a failed revision admission while
   retaining the saved revision intent for retry
 - `session.endTurn` — marks a still-started revision intent failed when its
   exact revision turn ends without submitting a replacement proposal, and
   emits `plans.changed` so the retry card refreshes
+
+- `plans.dueSchedules({ nowMs? })` returns `{ schedules, nextDueAt }`.
+  Without an explicit `nowMs`, scan/claim/recovery time is read after acquiring
+  Host state, so lock contention cannot extend the admission window.
+  Before reading, Host atomically marks schedules more than 120000 ms overdue
+  as missed and emits `plans.changed` once per transitioned proposal.
+  `schedules` contains eligible schedules at or before `nowMs` within that
+  inclusive grace window; `nextDueAt` is
+  the earliest eligible future timestamp in epoch milliseconds, or `null`. Both
+  queries require a scheduled snapshot, an approved proposal and no execution
+  state. This additive field needs no database migration.
+- Main polls immediately on start, then wakes at the next due time, clamped to
+  1–30 s (30 s when no schedule exists or `nextDueAt` is missing, non-numeric
+  or non-finite). `plans.changed` nudges the poller after
+  200 ms; system resume nudges it too. Polls are single-flight; a nudge during a
+  poll requests one follow-up. Host/sidecar unavailability, Host errors and
+  non-busy claim failures retry after 5 s. Busy schedules remain marked missed.
+  Stop and Host restart remove timers and notification subscriptions; restart
+  preserves stop → mark missed → drain → start recovery ordering. While the
+  running app sleeps, schedules can be claimed after resume only within that
+  inclusive two-minute grace window. Longer delays require explicit Run now;
+  startup/restart still mark all due schedules missed without a grace window.
+
 - `plans.queuedExecutions` / `plans.claimExecution` /
   `plans.finishExecution` — consume and transition execution fields on the
   same approval row; the claimed execution reports its `kind` so the sidecar can
   select the matching execution instruction
 - `plans.abort` — marks pending approval work interrupted; it never replays or
   changes an already-approved session back to its contract mode
+
+### Goal reports and real-time progress
+
+- `goalReports.get` / `goalReports.list` / `goalReports.submitDraft` / `goalReports.invalidateDraft` /
+  `goalReports.finalizeReport` / `goalReports.markFailed` / `goalReports.getAsset`
+  - `goalReports.finalizeReport` requires a terminal execution (`completed` or `interrupted`).
+    Attempting to finalize an execution that is in `queued`, `running`, or missing terminal state
+    is rejected with `GOAL_EXECUTION_NOT_TERMINAL`, without writing report files or broadcasting ready.
+- `goalProgress.get` — `{ executionId, sessionId? }` returns `{ progress: GoalProgressSnapshot | null }`.
+- `goalProgress.issueToken` — `{ executionId, sessionId, turnId }` generates and returns `{ writeToken }`
+  bound to the running turn recorded in `goal_reports.turn_id` and the effective Goal execution
+  (`COALESCE(execution_kind, kind) = goal`), not the earlier planning turn.
+- `goalProgress.update` — `{ executionId, sessionId, writeToken, expectedRevision?, items }` verifies
+  session identity, active running turn, running execution, and token validity. Updates increment `revision`
+  and broadcast `goalProgress.changed({ sessionId, executionId, revision })`.
+  Errors: `UNAUTHORIZED` (invalid or expired write token), `GOAL_PROGRESS_NOT_RUNNING` (execution or turn not running),
+  `CONFLICT` (optimistic concurrency mismatch on expectedRevision), `INVALID_PARAMS`.
 
 ### Scheduled tasks
 
@@ -856,7 +963,7 @@ Authoritative mode and workspace resolution are session-scoped:
 For `Read`/`Glob`/`Grep`/`Write`/`Edit`, the host classifies an explicit path
 outside the workspace and scratch roots before the low-risk auto-allow rule.
 `auto` executes it, while `ask` and `accept-edits` emit
-`permissions.request`; denial, timeout, or cancellation returns `TOOL_DENIED`
+`permissions.request`; denial or cancellation returns `TOOL_DENIED`
 without executing the operation. Relative `..` and symlink escapes use the
 same classification. Bash's working directory and implicit recursive walks do
 not inherit this exception.
@@ -1160,7 +1267,6 @@ params: {
   risk: "low" | "medium" | "high"
   argsPreview: unknown
   reason: string
-  timeoutMs: 120000
 }
 ```
 
@@ -1174,14 +1280,16 @@ params: {
 }
 ```
 
-Timeout behavior (**D005**): after 120s unresolved → deny.
+Local permission behavior (**D636 / ADR 0310**): an unresolved request remains
+pending until an explicit decision, cancellation, or host/process shutdown.
+The transport does not apply a deadline to `tools.execute`; tool-specific
+execution budgets still apply after approval.
 
 `permissions.pending` returns the open requests as Host state (D374/D375):
 `{ requests: PendingPermission[] }`, oldest first, optionally scoped by
 `sessionId`. Each entry carries the same fields as the `permissions.request`
-notification plus `createdAt`, `expiresAt`, and `remainingMs`. Requests past
-the timeout are omitted. A client that attaches after the notification was
-emitted reads this list and answers through the unchanged
+notification plus `createdAt`. Requests remain listed until settled. A client
+that attaches after the notification was emitted reads this list and answers through the unchanged
 `permissions.resolve`; the notification path itself does not change.
 
 ## 7. Error codes
@@ -1272,7 +1380,7 @@ Tool outcomes (`TOOL_DENIED`, `TOOL_TIMEOUT`, `PATH_OUTSIDE_WORKSPACE`,
 1. Electron spawns host and completes handshake
 2. health method returns ok
 3. denied tool path returns `TOOL_DENIED`
-4. timeout path returns deny decision after 120s
+4. an unresolved permission remains pending until an explicit decision or cancellation
 5. switching the selected workspace from A to B does not change the tool root
    of a call issued by session A
 6. Protocol v4 `session.endTurn` creates/returns exactly one notification for

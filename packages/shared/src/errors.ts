@@ -31,10 +31,6 @@ export const ErrorCodes = {
   HOST_UNAVAILABLE: "HOST_UNAVAILABLE",
   HOST_OVERLOADED: "HOST_OVERLOADED",
   AGENT_UNAVAILABLE: "AGENT_UNAVAILABLE",
-  /** The Node agent sidecar exited without a recognized failure signature. */
-  AGENT_SIDECAR_CRASHED: "AGENT_SIDECAR_CRASHED",
-  /** The Node agent sidecar hit its JavaScript heap limit. */
-  AGENT_SIDECAR_OOM: "AGENT_SIDECAR_OOM",
   APP_DEGRADED: "APP_DEGRADED",
   INTERNAL: "INTERNAL",
   INVALID_ARGUMENT: "INVALID_ARGUMENT",
@@ -69,6 +65,32 @@ export const ErrorCodes = {
    * same request succeed.
    */
   NETWORK_RESOLVE_FAILED: "NETWORK_RESOLVE_FAILED",
+  LIVE_DISABLED: "LIVE_DISABLED",
+  LIVE_NOT_CONFIGURED: "LIVE_NOT_CONFIGURED",
+  LIVE_PROVIDER_NOT_FOUND: "LIVE_PROVIDER_NOT_FOUND",
+  LIVE_AUTH_KIND_UNSUPPORTED: "LIVE_AUTH_KIND_UNSUPPORTED",
+  LIVE_AUTH_REQUIRED: "LIVE_AUTH_REQUIRED",
+  LIVE_ACCOUNT_ID_MISSING: "LIVE_ACCOUNT_ID_MISSING",
+  LIVE_ACCESS_DENIED: "LIVE_ACCESS_DENIED",
+  LIVE_RATE_LIMITED: "LIVE_RATE_LIMITED",
+  LIVE_PROTOCOL_UNSUPPORTED: "LIVE_PROTOCOL_UNSUPPORTED",
+  LIVE_PROTOCOL_ERROR: "LIVE_PROTOCOL_ERROR",
+  LIVE_ALREADY_ACTIVE: "LIVE_ALREADY_ACTIVE",
+  LIVE_REQUEST_CONFLICT: "LIVE_REQUEST_CONFLICT",
+  LIVE_SETTINGS_IN_USE: "LIVE_SETTINGS_IN_USE",
+  LIVE_MEDIA_RELEASE_UNCONFIRMED: "LIVE_MEDIA_RELEASE_UNCONFIRMED",
+  LIVE_STALE_CALL: "LIVE_STALE_CALL",
+  LIVE_INVALID_OWNER: "LIVE_INVALID_OWNER",
+  LIVE_MICROPHONE_BUSY: "LIVE_MICROPHONE_BUSY",
+  LIVE_MICROPHONE_DENIED: "LIVE_MICROPHONE_DENIED",
+  LIVE_MICROPHONE_UNAVAILABLE: "LIVE_MICROPHONE_UNAVAILABLE",
+  LIVE_MEDIA_UNSUPPORTED: "LIVE_MEDIA_UNSUPPORTED",
+  LIVE_PLAYBACK_BLOCKED: "LIVE_PLAYBACK_BLOCKED",
+  LIVE_TIMEOUT: "LIVE_TIMEOUT",
+  LIVE_NETWORK_ERROR: "LIVE_NETWORK_ERROR",
+  LIVE_NETWORK_POLICY_UNSUPPORTED: "LIVE_NETWORK_POLICY_UNSUPPORTED",
+  LIVE_AUDIO_BACKPRESSURE: "LIVE_AUDIO_BACKPRESSURE",
+  LIVE_EXECUTION_NOT_CONNECTED: "LIVE_EXECUTION_NOT_CONNECTED",
   AGENT_BUSY: "AGENT_BUSY",
   AGENT_NOT_FOUND: "AGENT_NOT_FOUND",
   TURN_NOT_FOUND: "TURN_NOT_FOUND",
@@ -83,6 +105,21 @@ export const ErrorCodes = {
   CONTEXT_COMPACTION_FAILED: "CONTEXT_COMPACTION_FAILED",
   STREAM_FAILED: "STREAM_FAILED",
   EMPTY_MODEL_RESPONSE: "EMPTY_MODEL_RESPONSE",
+  /**
+   * The Node agent sidecar process died mid-turn (native crash, kill, or an
+   * unclassified abort). Main and the headless runtime settle the owning turn
+   * with this code so a crash is visible in the durable transcript instead of
+   * reading as a plan-approval interruption.
+   */
+  AGENT_SIDECAR_CRASHED: "AGENT_SIDECAR_CRASHED",
+  /**
+   * The Node agent sidecar died after its JavaScript heap hit the configured
+   * cap (`--max-old-space-size`): the turn's context, tool output, or stream
+   * grew past what the runtime process can hold. Diagnosed from the child's
+   * stderr tail (`Reached heap limit` / `heap out of memory`); retrying the
+   * same turn fails the same way until the input shrinks.
+   */
+  AGENT_SIDECAR_OOM: "AGENT_SIDECAR_OOM",
   PROMPT_ENHANCEMENT_EMPTY: "PROMPT_ENHANCEMENT_EMPTY",
   SPEECH_NOT_CONFIGURED: "SPEECH_NOT_CONFIGURED",
   SPEECH_PROTOCOL_UNSUPPORTED: "SPEECH_PROTOCOL_UNSUPPORTED",
@@ -96,12 +133,15 @@ export const ErrorCodes = {
    * delegate's model, or how much it reads at once has to change.
    */
   SUBAGENT_CONTEXT_OVERFLOW: "SUBAGENT_CONTEXT_OVERFLOW",
+  SUBAGENT_OUTPUT_TRUNCATED: "SUBAGENT_OUTPUT_TRUNCATED",
   WORKSPACE_REQUIRED: "WORKSPACE_REQUIRED",
   PATH_OUTSIDE_WORKSPACE: "PATH_OUTSIDE_WORKSPACE",
   TOOL_NOT_FOUND: "TOOL_NOT_FOUND",
   TOOL_DENIED: "TOOL_DENIED",
   TOOL_TIMEOUT: "TOOL_TIMEOUT",
   TOOL_FAILED: "TOOL_FAILED",
+  /** Read/Write/Edit target path does not exist. Distinct from TOOL_DENIED. */
+  FILE_NOT_FOUND: "FILE_NOT_FOUND",
   /**
    * The mutation recovery guard stopped the turn after repeated same-path Edit
    * or patch-command failures (spec 18-line-anchored-edit-contract §9.3). Retriable: the user may continue.
@@ -110,6 +150,7 @@ export const ErrorCodes = {
   PROCESS_RESOURCE_EXHAUSTED: "PROCESS_RESOURCE_EXHAUSTED",
   TOOL_ABORTED: "TOOL_ABORTED",
   EDIT_TAG_REQUIRED: "EDIT_TAG_REQUIRED",
+  EDIT_LEGACY_MATCH_FAILED: "EDIT_LEGACY_MATCH_FAILED",
   EDIT_TAG_MISMATCH: "EDIT_TAG_MISMATCH",
   EDIT_TAG_UNKNOWN: "EDIT_TAG_UNKNOWN",
   EDIT_LINES_UNSEEN: "EDIT_LINES_UNSEEN",
@@ -166,6 +207,8 @@ export const ErrorCodes = {
   PLAN_EXECUTION_CONFLICT: "PLAN_EXECUTION_CONFLICT",
   PLAN_EXECUTION_FAILED: "PLAN_EXECUTION_FAILED",
   PLAN_EXECUTION_INTERRUPTED: "PLAN_EXECUTION_INTERRUPTED",
+  GOAL_EXECUTION_NOT_TERMINAL: "GOAL_EXECUTION_NOT_TERMINAL",
+  GOAL_PROGRESS_NOT_RUNNING: "GOAL_PROGRESS_NOT_RUNNING",
   PLUGIN_INVALID: "PLUGIN_INVALID",
   PLUGIN_LOAD_FAILED: "PLUGIN_LOAD_FAILED",
   /**
@@ -233,6 +276,8 @@ export const ErrorCodes = {
   PLUGIN_MARKET_RATE_LIMITED: "PLUGIN_MARKET_RATE_LIMITED",
   /** No distribution target can serve the package. */
   PLUGIN_MARKET_NO_SOURCE: "PLUGIN_MARKET_NO_SOURCE",
+  /** The offered bytes no longer match the reviewed source/version/hash. */
+  PLUGIN_MARKET_CHANGED: "PLUGIN_MARKET_CHANGED",
   /** The user cancelled an install while it was downloading. */
   PLUGIN_CANCELLED: "PLUGIN_CANCELLED",
   MCP_INVALID: "MCP_INVALID",
@@ -273,4 +318,14 @@ export const ErrorCodes = {
   TEAM_MAILBOX_FULL: "TEAM_MAILBOX_FULL",
   TEAM_MESSAGE_PAYLOAD_TOO_LARGE: "TEAM_MESSAGE_PAYLOAD_TOO_LARGE",
   TEAM_DELIVERY_PENDING: "TEAM_DELIVERY_PENDING",
+  /** A reviewed dispatch review must be confirmed before experts start. */
+  TEAM_APPROVAL_REQUIRED: "TEAM_APPROVAL_REQUIRED",
+  /** The review revision changed after the caller read it. */
+  TEAM_REVIEW_REVISION_CONFLICT: "TEAM_REVIEW_REVISION_CONFLICT",
+  /** A proposed provider/model/thinking route cannot be launched. */
+  TEAM_MODEL_SELECTION_INVALID: "TEAM_MODEL_SELECTION_INVALID",
+  /** The member holds a running turn or reserved queued work on its route. */
+  TEAM_MEMBER_MODEL_CHANGE_BLOCKED: "TEAM_MEMBER_MODEL_CHANGE_BLOCKED",
+  /** A Lead with durable Team work cannot become a standard session. */
+  TEAM_LEAD_CONFIGURATION_BLOCKED: "TEAM_LEAD_CONFIGURATION_BLOCKED",
 } as const;

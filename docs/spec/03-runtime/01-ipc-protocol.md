@@ -33,8 +33,9 @@ Principles:
 | `fs` | Work panel workspace file listing/reading/reveal, chat file-reference completion against the project, session scratch, and attachment roots, plus user-initiated open with the OS default handler (read-only) |
 | `window` | Frameless window state, controls, and compatibility work-panel geometry channels |
 | `menu` | Allowlisted application-menu commands and native editing/window actions |
-| `notification` | Durable inbox list/read/clear and new/activated events |
+| `notification` | Durable inbox list/read/clear, new/activated events, and native-notification sound cues |
 | `stats` | Completed-turn token history (host RPC; dashboard is plugin-owned) |
+| `voice/live` | App-owned real-time calls, secret-free status/settings DTOs, and per-call media ports |
 
 ## 3. Channel Conventions
 
@@ -151,7 +152,11 @@ name matches a loaded pi prompt template, the main-process handler expands
 the invocation (`parseCommandArgs` + `substituteArgs`) before persisting.
 The persisted user message stores `content = expanded text` plus an optional
 `command: string` field carrying the typed invocation for transcript
-display. Reseed replays `content`, so the agent context is identical across
+display. Explicit Skill invocations also persist validated `skillMentions`
+with UTF-16 offsets into `command`, allowing the transcript to show each
+Skill separately from the user's remaining text after reopening a session.
+These optional transcript metadata fields do not alter the model-facing
+`content`. Reseed replays `content`, so the agent context is identical across
 restarts. Builtin/plugin slash aliases never reach this channel — the
 renderer executes them locally. Unknown `/foo` passes through as literal
 content. Ordinary `@path` tokens are not transformed anywhere in the pipeline
@@ -199,13 +204,15 @@ content-addressed attachment store, and derives the effective model transport
 from the published model record plus the exact binding's `supportsImages`
 override. An absent or `null` override follows the published image capability;
 `true` enables and `false` disables image input for that configured model.
-Eligible images become transient pi-ai image blocks when the effective
-capability is enabled. Unknown/custom models without an explicit override,
-non-vision models, and images above the 10 MB inline bound receive a safe
-`@path` fallback.
-Main uses streamed hashing and file copying for images above that bound, and the
-sidecar uses the same bounded-read rule when rebuilding history. The durable
-user message stores `content` plus attachment metadata/ref, never base64.
+For a vision-capable model, images within the 10 MB per-image bound become
+transient pi-ai image blocks. Restored history also has a 30 MB aggregate raw
+image-byte budget: the sidecar considers persisted attachments newest-first and
+preserves every eligible image when the total fits. If the budget is exceeded,
+older images use the existing safe `@path` fallback. Unknown/custom models
+without an explicit image override, non-vision models, oversized images, and
+unavailable refs also use the safe fallback. Main uses streamed hashing and file
+copying for oversized images. The durable user message stores `content` plus
+attachment metadata/ref, never base64.
 Invalid attachment paths fail with `PATH_OUTSIDE_WORKSPACE`.
 
 Regenerate history (D109) also uses session channels:
@@ -217,11 +224,13 @@ Regenerate history (D109) also uses session channels:
 Root user turns may include `revisionRootId`, `revisionCount`, and
 `activeRevision`. Activating a revision replaces the live tail with
 `prefix + archived branch` and disposes the session agent.
-The sidecar receives only the prepared attachment subset needed for the
-current turn. On a vision runtime, persisted image refs are hydrated from the
-session-bound attachment/scratch roots when history is rebuilt; oversized or
-unavailable images remain path fallbacks. This keeps renderer, main, sidecar, the models.dev catalog, and host
-persistence on one capability-aware contract.
+The sidecar receives only the prepared attachment subset needed for the current
+turn. On a vision runtime, persisted refs are hydrated from session-bound
+attachment/scratch/project roots. The current prompt row is excluded by message
+id before hydration, so it does not consume the history budget; oversized,
+over-budget, or unavailable images remain safe path fallbacks. This keeps
+renderer, main, sidecar, the models.dev catalog, and host persistence on one
+capability-aware contract.
 
 ### 5.1a Steer an active turn
 
@@ -900,6 +909,11 @@ Main sends two events:
 - `pi-desktop/notification/event/activated` after the user clicks Electron's
   native system notification. Renderer follows its existing session-selection
   path, including project activation for a project-bound session.
+- `pi-desktop/notification/event/sound` is a payload-free, one-way cue for a
+  plugin-native notification that Electron successfully showed. Renderer plays
+  the shared soft chime; the event carries no notification content and creates
+  no inbox row. Native task, interactive, and plugin banners are silent so the
+  in-app chime is not doubled by a platform-specific sound.
 
 Plugin-owned session mutations additionally emit
 `pi-desktop/session/event/changed` after a successful write. The renderer
@@ -1520,6 +1534,9 @@ application-local `<data>/agent-capabilities/mcp.json` state file.
 - `mcp.list({ level, projectPath? })` → `{ servers: McpServerRecord[]; statuses: McpServerStatus[] }`
 - `mcp.active({ projectPath? })` → the effective runtime list
 - `mcp.upsert(server)` — creates or replaces the file at the requested level
+- `McpServerInput.timeoutSeconds` accepts an integer from 1 through 600.
+  Omitting it preserves the current value during an edit; sending `null` clears
+  the override and restores the runtime default.
 - `mcp.remove({ id, level, projectPath? })`
 - `mcp.setEnabled({ id, enabled, level, projectPath? })`
 - `mcp.setScope` remains a compatibility-shaped call; the Settings page uses
@@ -1605,6 +1622,17 @@ Only the description enters the prompt, and the body is fetched when the model
 invokes `Skill` (D174). A missing file is removed from the list and its local
 state is pruned during the next scan.
 
+The desktop `pi-desktop/skill/import` channel keeps the file picker
+single-select and returns `{ skill }` for that path. With
+`sourceKind: "dir"`, it lets the user select multiple directories and returns
+`{ imported: UserSkillRecord[], failed: { path, error }[] }`. Cancellation
+returns `{ canceled: true }` for either picker. Main calls `skills.import`
+separately for each selected directory so one error cannot roll back the
+others. After a successful folder import, Main stores the parent of the
+last successfully imported source folder in machine-local app data. The next
+directory picker opens there while that parent still exists. Cancellation and
+all-failed batches do not replace this preference.
+
 Desktop-only channels scan skill folders written by other agent tools on this
 machine — `~/.claude/skills/`, `<project>/.claude/skills/`, and the app's own
 `~/.agents/skills/` (or `PI_DESKTOP_AGENTS_DIR/skills/`) plus its project
@@ -1672,6 +1700,12 @@ Desktop-only MCP market channels (not host RPC) live on Electron IPC:
 ### MCP OAuth (ADR 0283)
 
 Browser-based OAuth 2.1 authentication for HTTP MCP servers is handled in the Electron main process via non-blocking IPC invocations and an event stream:
+
+Discovery preserves authorization-server issuer paths, trying OAuth path insertion,
+OIDC path insertion, then OIDC path appending (root issuers use the two root URLs).
+The authorization request uses the initial 401 Bearer challenge's `scope`, otherwise
+all valid protected-resource `scopes_supported` entries, otherwise omits `scope`.
+Authorization-server scope catalogs do not add or select requested permissions.
 
 - `pi-desktop/mcp/oauth/start({ id, level?, projectPath? }) -> { ok: true, loginId }`
   Initiates OAuth metadata discovery and PKCE authorization code flow. Returns immediately; user browser navigation and callback exchange proceed asynchronously in the background.
@@ -1802,13 +1836,17 @@ Renderer IPC kept for the Plan-safe preview facade and URL fallback:
 
 - `browser/openExternal({url?})` — allowlisted http(s)/mailto, or the current
   guest URL when omitted
-- event: `browser/event/state {url, title, isLoading, canGoBack, canGoForward}`
+- Renderer plugin-view open/close requests may carry `sessionId` and `tabId`.
+  Open binds the resource tab after checking the plugin contribution and scope;
+  close releases only that tab's retained page (or the session's pages when no
+  tab id is supplied). The shared plugin chrome is not closed with a sibling page.
+- event: `browser/event/state {url, title, isLoading, canGoBack, canGoForward, loadError?, sessionId?, tabId?}`
   (also pushed to plugin views as `browser:state`)
 - agent preview event: `browser/event/preview {sessionId, path?, url?}`.
   Electron Main resolves a workspace `path` to its real file path inside that
   session's project, rejecting symlink escapes and invalid absolute/file URLs,
-  loads the guest when that conversation's plugin view is visible, and the
-  renderer opens `plugin:pi.browser/browser` with `location` in the matching
+  asks the renderer to create a Browser resource tab before navigation, with
+  `location` in the matching
   runtime panel context. Navigation of a background session does not steal the
   visible guest.
 
@@ -1831,10 +1869,14 @@ Renderer IPC kept for the Plan-safe preview facade and URL fallback:
   containment as `fs/read`. Never returns non-image bytes. Renderer-only;
   not a plugin host API.
 - `fs/reveal({path})` → reveal in Finder. Same containment as `fs/read`.
-- `fs/open({path})` → open with the OS default application. Same lexical
-  containment as `fs/read` (without the extra realpath step used by reads).
+- `fs/open({path, mimeType?})` → open an existing regular file with the OS
+  default application. It uses the same realpath containment as `fs/read`,
+  including rejection of symlink escapes. For a content-addressed
+  `attachments/<sha256>` blob declared as `video/mp4`, the host creates a
+  `.mp4` symlink inside its private app-data directory before the OS handoff,
+  so the extensionless blob has a media association without copying its bytes.
 - `fs/resolveRef({ref, sessionId?})` → `FsChatRefResolveResult`
-  (`{ match: FsChatRefMatch | null }`, the match naming the answering `root`
+  (`{ match: FsChatRefMatch | null, reason?: "outside-allowed-roots" }`, the match naming the answering `root`
   (`workspace` / `scratch` / `attachments`), the `relativePath` relative to that
   root, the absolute `absolutePath`, `matchedBy` (`exact-relative` /
   `exact-absolute` / `path-suffix` / `basename`), and — for a `workspace` match
@@ -1842,11 +1884,11 @@ Renderer IPC kept for the Plan-safe preview facade and URL fallback:
   that answered); `sessionId` selects the
   session whose scratch store is searched. Completes a file reference the agent
   printed in chat, because the renderer cannot see the session's own scratch
-  store: an absolute reference that already names a real file inside a known
-  root wins outright, and an `attachments/<sha256>` blob resolves against the
+  store: an absolute reference only matches that exact file inside a known
+  root, and an `attachments/<sha256>` blob resolves against the
   attachment store directly only with a valid 64-character hex digest;
-  ordinary project paths such as `attachments/manual.pdf` still follow normal
-  workspace search. Otherwise the roots are searched in priority order
+  ordinary project paths such as `attachments/manual.pdf` still follow
+  normal workspace search. Otherwise the roots are searched in priority order
   — the open project first, the session's own scratch store
   (`<data_dir>/scratch/<sessionId>/`, ADR 0124) second, the attachment store
   last — and the first root that answers wins. The project is the folder group
@@ -1855,8 +1897,13 @@ Renderer IPC kept for the Plan-safe preview facade and URL fallback:
   so a shorthand resolves in a sibling folder as readily as in the primary one,
   and the match names the folder that answered. Inside one root an exact path
   beats a shorthand; among shorthands the longest matching tail wins, then the
-  shallowest path. The files-panel ignore set applies. A reference that matches
-  nothing returns `match: null`; resolving never opens anything (ADR 0262).
+  shallowest path. Relative and indexed candidates must resolve to regular files
+  whose real paths remain inside their answering root; an exact path through an
+  escaping or dangling link cannot fall back to a same-name indexed file. The
+  files-panel ignore set applies. A reference that matches
+  nothing returns `match: null`; an absolute path outside every allowed root
+  also returns `reason: "outside-allowed-roots"`, without trying a same-name
+  file inside a root. Resolving never opens anything (ADR 0262).
 - `fs/list` stays workspace-only; traversal outside is rejected
   (`INVALID_ARGUMENT`).
 
@@ -1954,7 +2001,17 @@ platform, and minimize-to-tray needs it whichever close behavior is stored.
 Maximize/unmaximize changes also emit
 `window/event/maximized`. Unknown actions fail. These Electron-only channels
 do not cross into host-core and do not change the host RPC protocol version.
-The preload intentionally exposes no arbitrary BrowserWindow resize channel.
+The preload exposes no arbitrary BrowserWindow bounds or resize channel.
+Windows retains Electron's native frameless edge/corner hit testing with
+`thickFrame: false`; the renderer does not submit window geometry.
+The Windows borderless fullscreen fallback is tracked in Main because Electron
+reports `isFullScreen() === false` while it uses display bounds for that mode;
+the window-control state and fullscreen event use the tracked value.
+`window/setBackgroundColor` remains Electron-local and main-renderer-only. Its
+optional `cornerRadius` is an integer from 0 to 24 DIP; omission restores the
+Windows main-window default of 4. Main applies the native shape on theme
+selection and resize, and clears the corner cutouts during maximize/fullscreen.
+Malformed values fail with `INVALID_ARGUMENT` before changing the background.
 Plugin panel chrome uses a separate Electron-local
 `pi-plugin-panel-window-control` channel with the same four semantic actions,
 but the handler resolves the target strictly from the sender's live panel
@@ -2321,7 +2378,18 @@ generic operations and the named session-delete, session-configure, and
 plan-resolution tools require `confirm: true`. That flag is an agent
 acknowledgement, not a desktop user prompt. All calls still pass through the
 existing IPC handler validation, host permissions, workspace boundaries, and
-error model. Both the text payload and `structuredContent` are size-bounded.
+error model. Both the text payload and `structuredContent` are size-bounded to
+512 KiB (`MAX_RESULT_CHARS`). A larger answer is not returned verbatim: it is
+replaced by `{truncated: true, reason: "MCP_RESULT_LIMIT", preview: "<the first
+512 KiB of the JSON>"}`, so an external caller can never receive a silently
+shortened payload. If an oversized answer comes from `session/get`
+(`pi_session_get`) and has a `compaction` record, Main projects that record to
+the compact identity (`createdAt` and `details.generation`) and checks the size
+again before returning the truncation envelope. This lets a long session's
+transcript survive when its unbounded `ContextCompactionRecord` (`summary` /
+`retainedTail` / `details.modifiedFiles`) alone caused the overflow. Results
+already under the limit retain their full compaction details, and the desktop's
+own session detail is unchanged.
 
 The six `session/collaboration/*` operations are first-party-plugin-only: they
 require an authenticated plugin tool invocation context, so they appear in
@@ -2345,6 +2413,61 @@ The renderer refreshes sessions and applies project/session selection from that
 event, so an external Agent can create a session, open a project, or submit a
 prompt while the visible desktop follows the same state. A control-server
 startup failure is logged and does not prevent the desktop from launching.
+
+### Local on/off preference and status IPC
+
+The control plane can also be switched from the desktop itself, without an
+environment variable. One rule decides the effective value of a launch:
+
+```text
+explicit PI_DESKTOP_MCP_CONTROL (0 or 1) > saved preference > false
+```
+
+Only the exact values `0` and `1` are explicit; any other value is treated as
+unset. The saved preference is the machine-local file
+`<electron user-data>/mcp-control-settings.json`, shaped `{"enabled": true|false}`,
+written with mode `0600` through a temporary file plus a rename, so a failed
+write leaves the previous value intact. It holds no token and no connection
+record — credentials remain in `mcp-control.token` and `mcp-control.json` — and
+it is never synced to an account or written to host SQLite.
+
+Two renderer channels expose the state through the existing preload `invoke`
+bridge and the shared whitelist, so no new preload surface exists:
+
+```ts
+mcpControlGet() -> McpControlStatus
+mcpControlSet({ enabled: boolean }) -> McpControlStatus
+
+type McpControlStatus = {
+  enabled: boolean;                      // effective value for this launch
+  running: boolean;                      // listening on the loopback port
+  source: "preference" | "environment";  // which input decided `enabled`
+  connectionFile: string;                // absolute path of mcp-control.json
+  error: string | null;                  // last failure reason, else null
+};
+```
+
+Neither response carries the bearer token or the rendered connection record.
+`mcpControlSet` drives the same `McpControlServer` the startup environment
+drives: start, confirm the listener (and `active: true` in the manifest), then
+save the preference; or close the listener, mark the manifest `active: false`,
+then save the preference. Mutations are serialized, so repeated or concurrent
+clicks never open a second listener. A failed start leaves the saved preference
+untouched and reports the real reason (for example a busy port), and a failed
+preference write stops the server that call opened. Disabling stops only the
+control plane: no Agent turn is stopped, aborted, or cancelled. When
+`PI_DESKTOP_MCP_CONTROL` is explicit, the environment decides the launch: the
+status reports `source: "environment"`, a contradicting request is reported in
+`error` instead of being applied, and neither the running state nor the saved
+preference changes. A request that agrees with the effective environment value,
+including a retry after a failed start, is applied as usual. A saved `true` whose
+startup start fails leaves the desktop
+running with `enabled: true`, `running: false`, and the reason in `error`; the
+retry is another `mcpControlSet({ enabled: true })`.
+
+Both channels stay outside the reviewed MCP operation catalog: an external MCP
+client can invoke desktop operations, but it cannot switch off the plane that
+serves it.
 
 ## 14. Error Codes — Initial registry (extensible)
 
@@ -2440,3 +2563,108 @@ done and total for that phase, and the bytes when they are known. A long upload
 of many resource objects is therefore not an interface with nothing to show.
 Background polls report nothing, since only the manual path has a caller
 watching.
+
+
+### Goal real-time progress tracking
+
+The renderer queries live goal progress via `goalProgressGet({ executionId, sessionId? })`
+and subscribes to real-time progress updates via the `goalProgressChanged` IPC event
+(`{ sessionId, executionId, revision }`). Progress notifications are decoupled from
+report finalization events (`goalReportsChanged`).
+Goal progress IPC routes remote-owned session IDs to the paired Host via the
+read-only `goalProgress/get` RACP operation. Remote progress events are translated
+to the Desktop session ID; token issuance and writes are not exposed to RACP.
+
+### Goal report asset reads and check observations
+
+`goalReports/getAsset` accepts the session/execution pair plus an asset id and
+a bounded chunk range. Host verifies that the execution belongs to the session,
+then serves only assets in that execution's report directory; manifest paths,
+absolute source references, parent traversal, symlink escapes and cross-session
+attachment references do not grant filesystem access. Unsupported or oversized
+images remain unavailable, and reads are bounded before loading bytes. The
+response carries MIME type, total bytes, hash, offset, base64 data and EOF.
+
+Check observations use persisted tool results from the same session up to the
+report's durable sequence. A model-supplied exit code is only a claim; missing
+or unverifiable references produce `inconclusive`, and a recorded failure must
+not be overwritten by a claimed success. These additive report fields do not
+change the database schema or grant renderer filesystem access.
+
+
+### Expert Team launch approval
+
+`team.declareStrategy` binds its caller and `leadTurnId` from the running Team
+Lead Agent runtime, never model parameters. `lead_only` records a reason;
+`delegate` creates a versioned pending review and no expert work. The strategy
+declaration and reviewed reads are sidecar-accessible; review update, confirm
+and cancel remain trusted Desktop operations. Plan/Goal omit Team mutations.
+
+`team.getExecutionDecision` retains explicit-turn reads; omitting `leadTurnId`
+returns the latest stored decision for that team, or null. It creates no
+approval or historical decision. `team.getLaunchReview` returns the latest or
+requested review without disclosing another team's body. Update/confirm/cancel
+use `expectedRevision`; conflicts have no side effects.
+
+Confirmation revalidates every selected provider/model/thinking binding and
+atomically persists the approved members, effective session/roster bindings,
+review/decision and one continuation keyed by review id. Retrying the accepted
+revision returns the same identities. Legacy creation, expert task execution
+and dispatch entry points reject missing approval with `TEAM_APPROVAL_REQUIRED`.
+Persisted historical queued messages retain existing recovery; paused Teams
+hold the continuation until explicit Resume. Pending reviews become interrupted
+on startup, while confirmed history is not automatically executed again.
+
+The review UI uses answered Host revisions, retains actual routes after failed
+updates, and discards stale results when the team or review changes. A Lead-only
+decision displays its reason without implying that experts were called.
+
+## 16. Live Voice API
+
+Live Voice is an app-owned call path described in [live-voice.md](live-voice.md)
+whose ownership is bound to the main window. Its DTOs are defined in
+`packages/shared/src/types/live-voice.ts`; the preload exposes only the
+allowlisted channels below. Main derives the owner from the invoking trusted
+frame and sends call events only to that frame. No payload can supply an owner
+identity or credentials. The docked widget window draws the call chrome without
+owning the call, so its three channels are validated separately and never enter
+owner derivation.
+
+| IPC channel | Direction | contract |
+|---|---|---|
+| `pi-desktop/voice/live/status` | Renderer → Main | redacted feature status, binding readiness and settings revision |
+| `pi-desktop/voice/live/prepare` | Renderer → Main | idempotent call preparation by request ID; synchronously reserves the shared microphone lease |
+| `pi-desktop/voice/live/connect` | Renderer → Main | connects a prepared call; Codex may include a bounded SDP offer |
+| `pi-desktop/voice/live/setMuted` | Renderer → Main | sets mute state with a monotonically increasing capture epoch |
+| `pi-desktop/voice/live/reportMedia` | Renderer → Main | reports capture, connection and release lifecycle; release acknowledgement is required before lease reuse |
+| `pi-desktop/voice/live/reportPlayback` | Renderer → Main | bounded list of played PCM cursors used for interruption/truncation |
+| `pi-desktop/voice/live/reportDelegation` | Renderer → Main | reports a provider-requested delegation; v1 rejects execution and never forwards it to Agent/MCP |
+| `pi-desktop/voice/live/reportControlApplied` | Renderer → Main | acknowledges a supported provider control or a rejected unsupported action |
+| `pi-desktop/voice/live/end` | Renderer → Main | idempotently ends an active call or cancels its pending request |
+| `pi-desktop/voice/live/heartbeat` | Renderer → Main | keeps the owning call alive while its renderer is responsive |
+| `pi-desktop/voice/live/event/changed` | Main → Renderer | redacted call phase, error, notice and activity updates |
+| `pi-desktop/voice/live/event/port` | Main → Renderer | transfers exactly one call-scoped `MessagePort` with its call ID and one-time nonce |
+| `pi-desktop/voice/live/event/control` | Main → Renderer | provider control request, limited to the explicit v1 control vocabulary |
+| `pi-desktop/voice/live/event/transcript` | Main → Renderer | transient bounded transcript event for the current call |
+| `pi-desktop/voice/live/widget/visibility` | Widget → Main | the docked widget's own presentation decision and the content box it needs; Main shows or hides that window accordingly |
+| `pi-desktop/voice/live/widget/action` | Widget → Main | a call action pressed in the docked widget; Main validates the sender and forwards it to the owner frame, which runs it |
+| `pi-desktop/voice/live/widget/ownerState` | Main window → Main | what only the owner frame knows: its own failure code (for example a refused mute) and whether the bound work session waits on a decision; neither is in the call view |
+| `pi-desktop/voice/live/event/widgetState` | Main → Widget | the authoritative call view plus the owner's own failure code and waiting-decision flag, pushed to the docked widget window |
+| `pi-desktop/voice/live/event/widgetAction` | Main → Main window | the forwarded widget action the owner frame has to run |
+
+The `MessagePort` is provisioned only after successful owner validation, then
+relayed by preload to the renderer window. The owner echoes the per-call nonce
+in its first `hello`; Main accepts the port once and only after the call ID and
+nonce match the prepared call. Its binary frames are bounded PCM audio, capture
+epochs, release acknowledgements, playback cursors and protocol readiness
+signals. It is not a generic IPC tunnel: it carries no provider
+credentials, arbitrary commands, workspace paths, Agent messages or durable
+transcripts. A port is closed on call end or owner loss.
+
+The docked widget window is not a call owner and can never become one: it is
+refused on every owner-validated channel with `PERMISSION_DENIED`, exactly like
+any other renderer. Main answers its two channels only when the sender is that
+window, and the owner's own failure code arrives through the main window, which
+is the frame that ran the action. A widget action never changes call state by
+itself: it is forwarded to the owner frame, and the resulting state reaches the
+widget through the same authoritative view the owner receives.

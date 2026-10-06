@@ -2,7 +2,7 @@ export const PROTOCOL_VERSION = 11 as const;
 export const SCHEMA_VERSION = 22 as const;
 export const APP_ID = "cn.sakura.pi-desktop";
 export const APP_NAME = "Pi-Desktop-Plus";
-export const APP_VERSION = "0.15.6";
+export const APP_VERSION = "0.15.7";
 
 export const APP_MENU_COMMANDS = [
   "newTask",
@@ -50,6 +50,11 @@ export type WindowControlAction = (typeof WINDOW_CONTROL_ACTIONS)[number];
 
 export const IPC = {
   invoke: {
+    storageGet: "pi-desktop/storage/get",
+    storageChoose: "pi-desktop/storage/choose",
+    storageMigrate: "pi-desktop/storage/migrate",
+    storageClearCache: "pi-desktop/storage/clearCache",
+    storageRemoveBackup: "pi-desktop/storage/removeBackup",
     appGetVersion: "pi-desktop/app/getVersion",
     appOpenFeedback: "pi-desktop/app/openFeedback",
     appHealth: "pi-desktop/app/health",
@@ -68,6 +73,8 @@ export const IPC = {
     updatesDownload: "pi-desktop/updates/download",
     updatesInstall: "pi-desktop/updates/install",
     updatesOpenReleases: "pi-desktop/updates/openReleases",
+    /** Persist the user's decision to stop nudging about one version (#1317). */
+    updatesDismiss: "pi-desktop/updates/dismiss",
     notificationList: "pi-desktop/notification/list",
     notificationMarkRead: "pi-desktop/notification/markRead",
     notificationMarkAllRead: "pi-desktop/notification/markAllRead",
@@ -91,6 +98,22 @@ export const IPC = {
     voiceUpdateSettings: "pi-desktop/voice/updateSettings",
     voiceCheckPermission: "pi-desktop/voice/checkPermission",
     voiceRequestPermission: "pi-desktop/voice/requestPermission",
+    liveVoiceStatus: "pi-desktop/voice/live/status",
+    liveVoicePrepare: "pi-desktop/voice/live/prepare",
+    liveVoiceConnect: "pi-desktop/voice/live/connect",
+    liveVoiceSetMuted: "pi-desktop/voice/live/setMuted",
+    liveVoiceReportMedia: "pi-desktop/voice/live/reportMedia",
+    liveVoiceReportPlayback: "pi-desktop/voice/live/reportPlayback",
+    liveVoiceReportDelegation: "pi-desktop/voice/live/reportDelegation",
+    liveVoiceReportControlApplied: "pi-desktop/voice/live/reportControlApplied",
+    liveVoiceEnd: "pi-desktop/voice/live/end",
+    liveVoiceHeartbeat: "pi-desktop/voice/live/heartbeat",
+    liveVoiceResolveWorkSelection: "pi-desktop/voice/live/work/resolveSelection",
+    liveVoiceStopWorkOperation: "pi-desktop/voice/live/work/stopOperation",
+    liveVoiceCancelQueuedOperation: "pi-desktop/voice/live/work/cancelQueuedOperation",
+    liveVoiceWidgetAction: "pi-desktop/voice/live/widget/action",
+    liveVoiceWidgetOwnerState: "pi-desktop/voice/live/widget/ownerState",
+    liveVoiceWidgetVisibility: "pi-desktop/voice/live/widget/visibility",
     agentCompact: "pi-desktop/agent/compact",
     agentAbort: "pi-desktop/agent/abort",
     agentStop: "pi-desktop/agent/stop",
@@ -130,8 +153,14 @@ export const IPC = {
     sessionOpenScratchPath: "pi-desktop/session/openScratchPath",
     teamGetRoster: "pi-desktop/team/getRoster",
     teamGetBoard: "pi-desktop/team/getBoard",
+    teamGetSnapshot: "pi-desktop/team/getSnapshot",
     teamPause: "pi-desktop/team/pause",
     teamResume: "pi-desktop/team/resume",
+    teamGetExecutionDecision: "pi-desktop/team/getExecutionDecision",
+    teamGetLaunchReview: "pi-desktop/team/getLaunchReview",
+    teamUpdateLaunchReview: "pi-desktop/team/updateLaunchReview",
+    teamConfirmLaunchReview: "pi-desktop/team/confirmLaunchReview",
+    teamCancelLaunchReview: "pi-desktop/team/cancelLaunchReview",
     projectOpenFolder: "pi-desktop/project/openFolder",
     settingsGet: "pi-desktop/settings/get",
     settingsSet: "pi-desktop/settings/set",
@@ -172,7 +201,6 @@ export const IPC = {
     projectSet: "pi-desktop/project/set",
     projectClear: "pi-desktop/project/clear",
     projectRemove: "pi-desktop/project/remove",
-    pullsList: "pi-desktop/pulls/list",
     scheduledList: "pi-desktop/scheduled/list",
     scheduledCreate: "pi-desktop/scheduled/create",
     scheduledUpdate: "pi-desktop/scheduled/update",
@@ -181,8 +209,10 @@ export const IPC = {
     scheduledExecute: "pi-desktop/scheduled/execute",
     scheduledListRuns: "pi-desktop/scheduled/listRuns",
     toolResolvePermission: "pi-desktop/tool/resolvePermission",
+    todosGet: "pi-desktop/todos/get",
     askToolResolve: "pi-desktop/agent/askTool/resolve",
     plansPending: "pi-desktop/plans/pending",
+    pendingInteractive: "pi-desktop/agent/pendingInteractive",
     plansResolve: "pi-desktop/plans/resolve",
     plansRunMissed: "pi-desktop/plans/runMissed",
     plansCancelSchedule: "pi-desktop/plans/cancelSchedule",
@@ -190,6 +220,8 @@ export const IPC = {
     goalReportGet: "pi-desktop/goalReport/get",
     goalReportList: "pi-desktop/goalReport/list",
     goalReportRetry: "pi-desktop/goalReport/retry",
+    goalReportGetAsset: "pi-desktop/goalReport/getAsset",
+    goalProgressGet: "pi-desktop/goalProgress/get",
     /**
      * List every paired remote `pi-host` this desktop knows, redacted so no
      * device token reaches the renderer. See ADR 0286 (R2b pairing UX).
@@ -242,6 +274,8 @@ export const IPC = {
     providersOauthCancel: "pi-desktop/providers/oauth/cancel",
     providersOauthDelete: "pi-desktop/providers/oauth/delete",
     pluginList: "pi-desktop/plugin/list",
+    /** A renderer slot component asking its own plugin for one JSON answer. */
+    pluginRendererCall: "pi-desktop/plugin/rendererCall",
     /** Plugin-contributed agent extensions (D387/D388, ADR 0214). */
     piSkillDiscover: "pi-desktop/plugin/discoverPiSkills",
     piSkillImport: "pi-desktop/plugin/importPiSkills",
@@ -293,6 +327,18 @@ export const IPC = {
     mcpImportScan: "pi-desktop/mcp/importScan",
     mcpImportRun: "pi-desktop/mcp/importRun",
     mcpMarketSearch: "pi-desktop/mcp/market/search",
+    /**
+     * Local MCP control plane status for this launch: effective enabled state,
+     * live listener state, the path of the connection manifest, and the last
+     * failure reason. Never contains the bearer token or the manifest itself.
+     */
+    mcpControlGet: "pi-desktop/mcp/control/get",
+    /**
+     * Enable or disable the local MCP control plane and persist the choice in
+     * the machine-local preference file. The startup environment wins while it
+     * is explicit, in which case the request is reported instead of applied.
+     */
+    mcpControlSet: "pi-desktop/mcp/control/set",
     skillList: "pi-desktop/skill/list",
     skillCreate: "pi-desktop/skill/create",
     skillImport: "pi-desktop/skill/import",
@@ -394,14 +440,23 @@ export const IPC = {
     notificationChanged: "pi-desktop/notification/event/changed",
     sessionsChanged: "pi-desktop/session/event/changed",
     notificationActivated: "pi-desktop/notification/event/activated",
+    notificationSound: "pi-desktop/notification/event/sound",
     plansChanged: "pi-desktop/plans/event/changed",
     goalReportChanged: "pi-desktop/goalReport/event/changed",
+    goalProgressChanged: "pi-desktop/goalProgress/event/changed",
     teamChanged: "pi-desktop/team/event/changed",
+    todosChanged: "pi-desktop/todos/event/changed",
     providersOauth: "pi-desktop/providers/oauth/event",
     mcpOauth: "pi-desktop/mcp/oauth/event",
     updatesState: "pi-desktop/updates/event/state",
     voiceStateChanged: "pi-desktop/voice/event/stateChanged",
     voiceModelProgress: "pi-desktop/voice/event/modelProgress",
+    liveVoiceChanged: "pi-desktop/voice/live/event/changed",
+    liveVoicePort: "pi-desktop/voice/live/event/port",
+    liveVoiceControl: "pi-desktop/voice/live/event/control",
+    liveVoiceTranscript: "pi-desktop/voice/live/event/transcript",
+    liveVoiceWidgetState: "pi-desktop/voice/live/event/widgetState",
+    liveVoiceWidgetAction: "pi-desktop/voice/live/event/widgetAction",
   },
 } as const;
 

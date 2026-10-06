@@ -12,10 +12,9 @@ import {
   type NativeMenuAction,
 } from "@pi-desktop/shared";
 import { installApplicationMenu } from "../application-menu";
-import {
-  installPluginAssetProtocol,
-  registerPluginAssetScheme,
-} from "../plugin-asset-protocol";
+import { installPluginAssetProtocol } from "../plugin-asset-protocol";
+import { installPluginRendererProtocol } from "../plugin-renderer-protocol";
+import { registerPluginSchemes } from "../plugin-schemes";
 import { applyNetworkProxyFromAppSettings } from "../network-proxy";
 import { readCloseBehavior } from "../window-preferences";
 import { createAgentHostBridge, type AgentHostBridge } from "../agent-host-bridge";
@@ -23,11 +22,15 @@ import { createBackendRouter, type BackendRouter } from "../remote/backend-route
 import { createRemoteHostsBoot, setActiveRemoteHostsBoot } from "./remote-hosts";
 import {
   createMcpControlController,
-  McpControlServer,
   mcpControlRendererEvent,
   type McpControlController,
   type McpControlInvokeInput,
+  type McpControlServer,
 } from "../mcp-control";
+import {
+  createMcpControlLifecycle,
+  setActiveMcpControlLifecycle,
+} from "../mcp-control-lifecycle";
 import type { ModelsDevCatalog } from "../models-dev-catalog";
 import type { AppUpdaterController } from "../updater";
 import type { HostProcess } from "../host-process";
@@ -78,11 +81,10 @@ export type StartupDependencies = {
   updater: AppUpdaterController;
   modelsDevCatalog: ModelsDevCatalog;
   plugins: PluginRuntime;
-  activeTurns: Map<string, string>;
   /**
    * Shared busy check from `runtime/session-coordination.ts`. The queue must
    * stay held while a turn's announcement is still running, so this cannot be
-   * derived here from `activeTurns` alone.
+   * be derived from the startup state alone.
    */
   isSessionBusy: (sessionId: string) => boolean;
   getHost: () => HostProcess | null;
@@ -124,7 +126,7 @@ export type StartupDependencies = {
 export function registerApplicationStartup(deps: StartupDependencies): void {
   // Electron only accepts scheme privileges before the app is ready, and this
   // runs from the composition root, before the `whenReady` promise can settle.
-  registerPluginAssetScheme();
+  registerPluginSchemes();
   // Crashpad ships with Electron, so the reporter needs no native dependency.
   // Dumps stay local (`uploadToServer: false`) under the installation data
   // directory so a `PI_DESKTOP_DATA_DIR` profile does not share them. Started
@@ -150,7 +152,6 @@ export function registerApplicationStartup(deps: StartupDependencies): void {
       updater,
       modelsDevCatalog,
       plugins,
-      activeTurns,
       isSessionBusy,
       getHost,
       getMainWindow,
@@ -179,6 +180,20 @@ export function registerApplicationStartup(deps: StartupDependencies): void {
     if (!hasSingleInstanceLock) return;
     applyDevelopmentBranding();
 
+    // The optional local MCP control plane has exactly one lifecycle for both
+    // the startup preference and the settings IPC: one server slot, one
+    // start/stop path. Bound before IPC registration so a renderer that calls
+    // the settings channel during boot can never observe an unbound plane.
+    const mcpControl = createMcpControlLifecycle({
+      dataDir,
+      getServer: () => state.mcpControl,
+      setServer: (server) => {
+        state.mcpControl = server;
+      },
+      log: (level, message, data) => logger.app("runtime", level, message, { data }),
+    });
+    setActiveMcpControlLifecycle(mcpControl);
+
     // A Chromium-process crash from a previous run left a minidump, and nothing
     // else would ever mention it. Report one durable line per new dump set,
     // classified by process type, then advance the marker. Reporting is
@@ -194,6 +209,11 @@ export function registerApplicationStartup(deps: StartupDependencies): void {
     // scheme itself was reserved in `registerApplicationStartup`.
     installPluginAssetProtocol((pluginId, assetPath) =>
       plugins.resolveThemeAsset(pluginId, assetPath),
+    );
+    // Serve renderer entry modules the same way — the current load of a
+    // plugin that declared `manifest.renderer` and holds `renderer.extension`.
+    installPluginRendererProtocol((pluginId, generation, requestPath) =>
+      plugins.resolveRendererSource(pluginId, generation, requestPath),
     );
     // Load the close-behavior preference before the first window exists: the
     // close handler reads `closeBehavior` synchronously, and a window created
@@ -342,31 +362,23 @@ export function registerApplicationStartup(deps: StartupDependencies): void {
       applyToggleWindowShortcut();
     }
     await ensureWindow();
-    if (process.env.PI_DESKTOP_MCP_CONTROL === "1") {
-      try {
-        state.mcpControl = new McpControlServer({
-          dataDir,
-          invoke: invokeIpc,
-          channels: IPC.invoke,
-          version: APP_VERSION,
-          port: process.env.PI_DESKTOP_MCP_PORT
-            ? Number(process.env.PI_DESKTOP_MCP_PORT)
-            : undefined,
-          controller: state.desktopControl ?? undefined,
-          log: (level, message, data) => logger.app("runtime", level, message, { data }),
-        });
-        await state.mcpControl.start();
-      } catch (error) {
-        logger.app("runtime", "warn", "MCP control server failed to start", {
-          data: String(error),
-        });
-        state.mcpControl = null;
-      }
-    }
+    // Start the control plane from the effective preference: an explicit
+    // PI_DESKTOP_MCP_CONTROL wins over the saved value, and a failed start is
+    // reported to the settings surface instead of holding up the desktop.
+    await mcpControl.startFromPreference({
+      invoke: invokeIpc,
+      channels: IPC.invoke,
+      controller: state.desktopControl ?? undefined,
+      version: APP_VERSION,
+    });
     // GitHub discovery is delayed and time-bounded. Never start it before the
     // first window exists: a hung feed used to sit in "checking" for ~60s and
     // compete with boot for the net stack.
-    updater.startAutoCheck();
+    // Adopt legacy NSIS baselines before the delayed feed check can start. The
+    // filesystem work runs after the first window exists and never blocks boot.
+    void updater
+      .reclaimRelocatedUpdateCache()
+      .finally(() => updater.startAutoCheck());
     // createWindow awaits the initial load (loadFile resolves on
     // did-finish-load), so the page is up; give React a beat to mount its
     // event subscriptions before pushing the boot outcome.
@@ -417,10 +429,7 @@ export function registerApplicationStartup(deps: StartupDependencies): void {
                };
              })()`,
             );
-            let resolveCtrlR: ((prevented: boolean) => void) | undefined;
-            const ctrlRObserved = new Promise<boolean>((resolve) => {
-              resolveCtrlR = resolve;
-            });
+            let ctrlRPrevented = false;
             const observeCtrlR = (
               event: Electron.Event,
               input: Electron.Input,
@@ -433,7 +442,7 @@ export function registerApplicationStartup(deps: StartupDependencies): void {
                 !input.alt &&
                 !input.shift
               ) {
-                resolveCtrlR?.(event.defaultPrevented);
+                ctrlRPrevented = event.defaultPrevented;
               }
             };
             window!.webContents.on("before-input-event", observeCtrlR);
@@ -448,16 +457,14 @@ export function registerApplicationStartup(deps: StartupDependencies): void {
                 keyCode: "R",
                 modifiers: ["control"],
               });
-              probe.ctrlRBlocked = await Promise.race([
-                ctrlRObserved,
-                new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 2_000)),
-              ]);
+              await new Promise((resolve) => setTimeout(resolve, 100));
             } finally {
               window!.webContents.removeListener(
                 "before-input-event",
                 observeCtrlR,
               );
             }
+            probe.ctrlRBlocked = ctrlRPrevented;
             probe.appName = app.getName();
             probe.menuCount = Menu.getApplicationMenu()?.items.length ?? 0;
             if (!host || !window) throw new Error("session-list probe requires a healthy desktop");

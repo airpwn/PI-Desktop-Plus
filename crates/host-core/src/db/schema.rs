@@ -1,4 +1,33 @@
-pub(crate) const SCHEMA_LATEST: &str = r#"
+/// `session_todo` table and its partial unique index in one place, so the
+/// fresh schema and the v20 -> v21 migration cannot drift. `IF NOT EXISTS`
+/// keeps the migration idempotent for a database that was downgraded in
+/// place (a test fixture) while still being a no-op on an empty schema.
+macro_rules! session_todo_ddl {
+    () => {
+        r#"
+CREATE TABLE IF NOT EXISTS session_todo (
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  position   INTEGER NOT NULL CHECK (position >= 0 AND position < 50),
+  content    TEXT NOT NULL CHECK (
+               length(content) > 0 AND length(content) <= 500
+               AND instr(content, char(0)) = 0
+             ),
+  status     TEXT NOT NULL CHECK (status IN ('pending', 'in_progress', 'completed', 'cancelled')),
+  priority   TEXT NOT NULL DEFAULT 'medium' CHECK (priority IN ('high', 'medium', 'low')),
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (session_id, position)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_todo_active
+  ON session_todo(session_id) WHERE status = 'in_progress';
+"#
+    };
+}
+
+/// Same DDL as the fresh schema, exposed for the v20 -> v21 migration.
+pub(crate) const SESSION_TODO_DDL: &str = session_todo_ddl!();
+
+pub(crate) const SCHEMA_LATEST: &str = concat!(
+    r#"
 CREATE TABLE kv (
   ns         TEXT NOT NULL,
   key        TEXT NOT NULL,
@@ -65,18 +94,22 @@ CREATE TABLE sessions (
                                           'high', 'xhigh', 'max', 'omit')),
   permission_mode TEXT NOT NULL DEFAULT 'inherit'
                 CHECK (permission_mode IN ('inherit', 'ask', 'accept-edits', 'auto')),
-  execution_profile TEXT NOT NULL DEFAULT 'standard'
-                CHECK (execution_profile IN ('standard', 'team')),
   source      TEXT,
   deleted_at  INTEGER,
   pinned      INTEGER NOT NULL DEFAULT 0,
   last_seq    INTEGER NOT NULL DEFAULT 0,
+  todo_revision INTEGER NOT NULL DEFAULT 0,
+  todo_updated_at INTEGER,
   created_at  INTEGER NOT NULL,
   updated_at  INTEGER NOT NULL
 );
 CREATE INDEX idx_sessions_updated ON sessions(updated_at DESC);
 CREATE INDEX idx_sessions_project ON sessions(project_id) WHERE project_id IS NOT NULL;
 CREATE INDEX idx_sessions_deleted ON sessions(deleted_at) WHERE deleted_at IS NOT NULL;
+
+"#,
+    session_todo_ddl!(),
+    r#"
 
 CREATE TABLE session_import_origins (
   plugin_id    TEXT NOT NULL,
@@ -118,9 +151,11 @@ CREATE TABLE turn_queue (
   content          TEXT NOT NULL,
   attachments_json TEXT,
   session_message_id TEXT,
+  user_message_id TEXT,
   permission_mode  TEXT NOT NULL,
   position         INTEGER NOT NULL,
   priority         INTEGER,
+  voice_origin_json TEXT,
   created_at       INTEGER NOT NULL
 );
 CREATE INDEX idx_turn_queue_session ON turn_queue(session_id, position);
@@ -240,7 +275,8 @@ CREATE TABLE audit_log (
 CREATE INDEX idx_audit_ts ON audit_log(ts);
 CREATE INDEX idx_audit_session ON audit_log(session_id, ts) WHERE session_id IS NOT NULL;
 
-"#;
+"#,
+);
 
 /// Approval storage is kept in one batch so fresh databases and migrations
 /// cannot drift in table names, checks, or indexes.
@@ -251,7 +287,6 @@ CREATE TABLE IF NOT EXISTS plan_approvals (
   turn_id               TEXT NOT NULL,
   tool_call_id          TEXT NOT NULL UNIQUE,
   kind                  TEXT NOT NULL DEFAULT 'plan' CHECK (kind IN ('plan', 'goal')),
-  artifact_workspace_kind TEXT NOT NULL DEFAULT 'project' CHECK (artifact_workspace_kind IN ('project', 'scratch')),
   plan_json             TEXT NOT NULL,
   title                 TEXT NOT NULL DEFAULT '',
   question              TEXT NOT NULL DEFAULT '',
@@ -272,13 +307,6 @@ CREATE TABLE IF NOT EXISTS plan_approvals (
   artifact_size_bytes   INTEGER,
   version               INTEGER NOT NULL DEFAULT 1,
   execution_id          TEXT UNIQUE,
-  execution_provider_id TEXT,
-  execution_model_id    TEXT,
-  execution_kind        TEXT CHECK (execution_kind IN ('plan', 'goal')),
-  revision_intent_json  TEXT,
-  revision_state        TEXT CHECK (revision_state IN ('ready', 'started', 'failed', 'submitted')),
-  revision_turn_id      TEXT,
-  revision_error_code   TEXT,
   execution_state       TEXT CHECK (execution_state IN (
     'queued', 'running', 'completed', 'interrupted'
   ))
@@ -294,66 +322,4 @@ CREATE INDEX IF NOT EXISTS idx_plan_approvals_execution_queue
   WHERE execution_state IN ('queued', 'running');
 CREATE INDEX IF NOT EXISTS idx_plan_approvals_execution_id
   ON plan_approvals(execution_id) WHERE execution_id IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS plan_execution_schedules (
-  proposal_id   TEXT PRIMARY KEY REFERENCES plan_approvals(request_id) ON DELETE CASCADE,
-  scheduled_for INTEGER NOT NULL,
-  timezone      TEXT NOT NULL,
-  state         TEXT NOT NULL CHECK (state IN ('scheduled', 'missed', 'claimed', 'cancelled')),
-  updated_at    INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_plan_execution_schedules_due
-  ON plan_execution_schedules(state, scheduled_for);
-"#;
-
-/// Canonical Team tables (ADR 0307). Kept in one batch so fresh databases and
-/// migrations share the identical definition, checks, and indexes.
-pub(crate) const TEAM_SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS teams (
-  team_session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
-  revision        INTEGER NOT NULL DEFAULT 1,
-  paused          INTEGER NOT NULL DEFAULT 0,
-  created_at      INTEGER NOT NULL,
-  updated_at      INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS team_members (
-  team_session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-  member_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-  name              TEXT NOT NULL,
-  description       TEXT,
-  context_kind      TEXT NOT NULL DEFAULT 'fresh'
-                    CHECK (context_kind IN ('fresh', 'fork')),
-  phase             TEXT NOT NULL DEFAULT 'provisioning'
-                    CHECK (phase IN ('provisioning', 'idle', 'running', 'failed', 'completed')),
-  model_id          TEXT,
-  provider_id       TEXT,
-  error             TEXT,
-  created_at        INTEGER NOT NULL,
-  updated_at        INTEGER NOT NULL,
-  PRIMARY KEY (team_session_id, name),
-  UNIQUE (team_session_id, member_session_id)
-);
-CREATE INDEX IF NOT EXISTS idx_team_members_session
-  ON team_members(member_session_id);
-
-CREATE TABLE IF NOT EXISTS team_tasks (
-  team_session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-  task_id           TEXT NOT NULL,
-  revision          INTEGER NOT NULL DEFAULT 1,
-  subject           TEXT NOT NULL,
-  description       TEXT,
-  status            TEXT NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending', 'in_progress', 'completed', 'failed', 'cancelled')),
-  owner_session_id  TEXT REFERENCES sessions(id) ON DELETE SET NULL,
-  owner_member_name TEXT,
-  blocked_by_json   TEXT NOT NULL DEFAULT '[]',
-  write_scopes_json TEXT NOT NULL DEFAULT '[]',
-  deleted           INTEGER NOT NULL DEFAULT 0,
-  created_at        INTEGER NOT NULL,
-  updated_at        INTEGER NOT NULL,
-  PRIMARY KEY (team_session_id, task_id)
-);
-CREATE INDEX IF NOT EXISTS idx_team_tasks_status
-  ON team_tasks(team_session_id, status);
 "#;

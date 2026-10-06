@@ -9,7 +9,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { desktopPaths, repositoryRoot, resolveElectronBinary } from "./e2e/boot.mjs";
+import { desktopPaths, findDesktopRendererTarget, repositoryRoot, resolveElectronBinary } from "./e2e/boot.mjs";
 import { resolveHostBinary } from "./e2e/host.mjs";
 import { planModelFixture } from "./e2e/plan-model.mjs";
 
@@ -477,12 +477,7 @@ async function connectRenderer(state) {
     async () => {
       try {
         const targets = await fetchJsonList(state.cdpPort);
-        return targets.find(
-          (target) =>
-            target.type === "page" &&
-            target.webSocketDebuggerUrl &&
-            (target.url.startsWith("file:") || target.title === "PI-Desktop"),
-        );
+        return findDesktopRendererTarget(targets, appDir);
       } catch {
         return null;
       }
@@ -1628,7 +1623,7 @@ async function runAcceptance(state) {
   await waitFor(
     async () => {
       const current = await inspectUi(state);
-      return current.bar?.status === "approved" ? current : null;
+      return current.bar?.status === "approved" && current.modeValue === "agent" ? current : null;
     },
     "post-approval renderer approval surface cleared",
     state,
@@ -1666,6 +1661,61 @@ async function runAcceptance(state) {
     "approved Plan Markdown preview",
     state,
   );
+
+  // T1: verify file viewer geometry under container queries (400, 480, 481, >=960px)
+  const checkWidth = async (width) => {
+    return state.cdp.evaluate(`(() => {
+      const body = document.querySelector(".file-viewer-body");
+      const md = document.querySelector(".file-viewer-markdown");
+      if (!body || !md) return { found: false };
+      const originalWidth = body.style.width;
+      body.style.width = "${width}px";
+      const style = getComputedStyle(md);
+      const paddingTop = parseFloat(style.paddingTop);
+      const paddingLeft = parseFloat(style.paddingLeft);
+      const paddingRight = parseFloat(style.paddingRight);
+      const paddingBottom = parseFloat(style.paddingBottom);
+      const child = md.querySelector("h1, h2, p, ul, ol, table") || md.firstElementChild;
+      const childStyle = child ? getComputedStyle(child) : null;
+      const childMaxWidth = childStyle ? childStyle.maxWidth : null;
+      body.style.width = originalWidth;
+      return {
+        found: true,
+        paddingTop,
+        paddingLeft,
+        paddingRight,
+        paddingBottom,
+        childMaxWidth,
+      };
+    })()`);
+  };
+
+  const w400 = await checkWidth(400);
+  assert(w400.found, "file-viewer-markdown not found for 400px geometry");
+  assert(w400.paddingTop === 12 && w400.paddingLeft === 14 && w400.paddingBottom === 20,
+    `w400 padding mismatch: ${JSON.stringify(w400)}`);
+  assert(w400.childMaxWidth === "880px", `w400 max-width mismatch: ${w400.childMaxWidth}`);
+
+  const w480 = await checkWidth(480);
+  assert(w480.paddingTop === 12 && w480.paddingLeft === 14 && w480.paddingBottom === 20,
+    `w480 padding mismatch: ${JSON.stringify(w480)}`);
+
+  const w481 = await checkWidth(481);
+  assert(w481.paddingTop === 16 && w481.paddingLeft === 20 && w481.paddingBottom === 24,
+    `w481 padding mismatch: ${JSON.stringify(w481)}`);
+
+  const w1000 = await checkWidth(1000);
+  assert(w1000.paddingTop === 16 && w1000.paddingLeft === 20 && w1000.paddingBottom === 24,
+    `w1000 padding mismatch: ${JSON.stringify(w1000)}`);
+  assert(w1000.childMaxWidth === "880px", `w1000 max-width mismatch: ${w1000.childMaxWidth}`);
+
+  // Capture light and dark screenshots of the file preview
+  await captureScreenshot(state, "e2e-plan-markdown-preview-dark");
+  await state.cdp.evaluate(`document.documentElement.dataset.theme = "light"`);
+  await delay(150);
+  await captureScreenshot(state, "e2e-plan-markdown-preview-light");
+  await state.cdp.evaluate(`document.documentElement.dataset.theme = "dark"`);
+  await delay(150);
   await clickSelector(state, '[data-work-panel-tab-id="overview"] .work-panel-tab-button', "Overview tab");
   const overviewLabel = await state.cdp.evaluate(`document.querySelector('[data-work-panel-tab-id="overview"] .work-panel-tab-label')?.textContent?.trim()`);
   assert(overviewLabel === "概要", `Overview tab label is not localized: ${overviewLabel}`);
@@ -1770,8 +1820,6 @@ async function runAcceptance(state) {
   const sourcePlan = await submitPlan(state, goalSession.id, "goalSource");
   await settlePlanProbe(state, goalSession.id, sourcePlan.turnId, "completed");
   await waitFor(async () => (await inspectUi(state)).bar?.status === "pending", "source Plan card", state);
-  fixture.setScenario("goal");
-  fixture.setScenario("goal");
   await clickSelector(state, '[data-testid="plan-approval-bar"] .plan-approval-goal-toggle [role="switch"]', "Convert Plan to Goal");
   await clickSelector(state, '[data-testid="plan-approval-bar"] .plan-approval-approve-main', "Approve Plan as Goal");
   const approvedGoal = await waitFor(async () => {
@@ -1779,7 +1827,23 @@ async function runAcceptance(state) {
     return result.history?.find((item) => item.id === sourcePlan.proposalId && item.status === "approved" && item.executionKind === "goal");
   }, "Plan approved with executionKind goal", state, 45_000);
   assert(approvedGoal, "Approved execution did not have executionKind = goal");
-  record("E2E-PLAN-GOAL-CONVERSION", true, `plan=${sourcePlan.proposalId} executionKind=${approvedGoal.executionKind}`);
+  // Approval starts a real Agent turn. Let it end before the next case: a run
+  // left streaming keeps the renderer busy and starves every later CDP call.
+  const finishedGoal = await waitFor(async () => {
+    const result = await getPreloadResult(state, "plansPending", [{ sessionId: goalSession.id }]);
+    return result.history?.find((item) =>
+      item.id === sourcePlan.proposalId && (item.executionState === "completed" || item.executionState === "interrupted"));
+  }, "converted Goal execution to finish", state, 45_000);
+  assert(finishedGoal.executionState === "completed", `converted Goal execution ended ${finishedGoal.executionState}`);
+  await waitFor(async () => {
+    const result = await getPreloadResult(state, "agentGetStatus", [goalSession.id]);
+    return result?.status?.isRunning === false;
+  }, "converted Goal session to become idle", state);
+  record(
+    "E2E-PLAN-GOAL-CONVERSION",
+    true,
+    `plan=${sourcePlan.proposalId} executionKind=${approvedGoal.executionKind} executionState=${finishedGoal.executionState}`,
+  );
   await captureScreenshot(state, "e2e-plan-goal-conversion");
 
   const alternate = (await getPreloadResult(state, "providersCreate", [{

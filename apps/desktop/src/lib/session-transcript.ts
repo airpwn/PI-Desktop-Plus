@@ -1,4 +1,10 @@
 import type { AgentEvent, MessageAttachment, UiMessage } from "@pi-desktop/shared";
+import {
+  getSessionMessageSnapshot,
+  registerSessionMessageAppend,
+  registerSessionMessageReplacement,
+  registerSessionMessageRewrite,
+} from "./session-transcript-updates";
 
 type OptimisticFileReference = {
   path: string;
@@ -8,6 +14,9 @@ type OptimisticFileReference = {
   /** Large-text paste tokens travel inline in the text, not as attachments. */
   token?: string;
 };
+
+const OPTIMISTIC_USER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MAX_OPTIMISTIC_ECHO_DELAY_MS = 30_000;
 
 /**
  * The user row shown the moment a prompt is sent, before the host has
@@ -64,7 +73,9 @@ export function projectMessageEnd(
         message.id === replacesMessageId && message.role === "assistant",
     );
     if (index >= 0) {
-      next = [...messages.slice(0, index), ...messages.slice(index + 1)];
+      next = registerSessionMessageRewrite(messages, [
+        ...messages.slice(0, index), ...messages.slice(index + 1),
+      ]);
     }
   }
   const failed =
@@ -85,6 +96,7 @@ export function projectMessageEnd(
  * position, but use the last value, matching host-core's keep-last policy.
  */
 export function dedupeSessionMessages(messages: UiMessage[]): UiMessage[] {
+  if (getSessionMessageSnapshot(messages).unique) return messages;
   const positions = new Map<string, number>();
   let next: UiMessage[] | undefined;
   for (const [index, message] of messages.entries()) {
@@ -101,7 +113,7 @@ export function dedupeSessionMessages(messages: UiMessage[]): UiMessage[] {
     if (!next) next = messages.slice(0, index);
     next[previous] = message;
   }
-  return next ?? messages;
+  return next ? registerSessionMessageRewrite(messages, next) : messages;
 }
 
 /**
@@ -113,12 +125,12 @@ export function upsertLiveSessionMessage(
   message: UiMessage,
 ): UiMessage[] {
   const normalized = dedupeSessionMessages(messages);
-  const index = normalized.findIndex((candidate) => candidate.id === message.id);
-  if (index < 0) return [...normalized, message];
+  const index = getSessionMessageSnapshot(normalized).positions.get(message.id);
+  if (index === undefined) return registerSessionMessageAppend(normalized, [...normalized, message]);
   if (normalized[index] === message) return normalized;
   const next = normalized.slice();
   next[index] = message;
-  return next;
+  return registerSessionMessageReplacement(normalized, next, index);
 }
 
 /** Replace only the acknowledged submission identity, never an equal-text row. */
@@ -132,7 +144,8 @@ export function reconcilePersistedUserMessage(
     !messages.some((row) => row.id === optimisticMessageId && row.role === "user")
   ) return messages;
   return upsertLiveSessionMessage(
-    messages.map((row) => row.id === optimisticMessageId ? message : row),
+    registerSessionMessageRewrite(messages,
+      messages.map((row) => row.id === optimisticMessageId ? message : row)),
     message,
   );
 }
@@ -146,9 +159,11 @@ export function removeLiveSessionMessage(
   messageId: string,
 ): UiMessage[] {
   const normalized = dedupeSessionMessages(messages);
-  const index = normalized.findIndex((message) => message.id === messageId);
-  if (index < 0) return normalized;
-  return [...normalized.slice(0, index), ...normalized.slice(index + 1)];
+  const index = getSessionMessageSnapshot(normalized).positions.get(messageId);
+  if (index === undefined) return normalized;
+  return registerSessionMessageRewrite(normalized, [
+    ...normalized.slice(0, index), ...normalized.slice(index + 1),
+  ]);
 }
 
 /**
@@ -190,9 +205,49 @@ export function mergeLiveSessionMessages(
   }
 
   const used = new Set<string>();
+  // An optimistic prompt whose reconcile event was missed survives with its
+  // temporary UUID id, so id-based merging can replay it next to the durable
+  // echo (#1308). Content alone is not identity: only collapse an attachment-
+  // free optimistic row when one same-text durable user row was persisted
+  // shortly after that optimistic row. This keeps an older identical prompt
+  // from hiding a newly submitted one.
+  const matchedDurableUserIds = new Set<string>();
+  const collapsedOptimisticIds = new Set<string>();
+  for (const optimistic of liveNormalized) {
+    if (
+      optimistic.role !== "user" ||
+      optimistic.status !== "complete" ||
+      !OPTIMISTIC_USER_ID.test(optimistic.id) ||
+      durableIds.has(optimistic.id) ||
+      optimistic.attachments?.length
+    ) continue;
+    const optimisticTime = Date.parse(optimistic.createdAt ?? "");
+    if (!Number.isFinite(optimisticTime)) continue;
+    const candidates = durable
+      .filter((message) =>
+        message.role === "user" &&
+        !message.attachments?.length &&
+        !matchedDurableUserIds.has(message.id) &&
+        message.content === optimistic.content,
+      )
+      .map((message) => ({
+        message,
+        delay: Date.parse(message.createdAt ?? "") - optimisticTime,
+      }))
+      .filter(({ delay }) => delay >= 0 && delay <= MAX_OPTIMISTIC_ECHO_DELAY_MS)
+      .sort((left, right) => left.delay - right.delay);
+    if (!candidates.length) continue;
+    if (candidates.length > 1 && candidates[0].delay === candidates[1].delay) continue;
+    matchedDurableUserIds.add(candidates[0].message.id);
+    collapsedOptimisticIds.add(optimistic.id);
+  }
   const merged: UiMessage[] = [];
   const push = (message: UiMessage) => {
     if (used.has(message.id)) return;
+    if (collapsedOptimisticIds.has(message.id)) {
+      used.add(message.id);
+      return;
+    }
     used.add(message.id);
     merged.push(message);
   };
@@ -234,7 +289,8 @@ export function mergeLiveSessionMessages(
   }
 
   for (const message of liveNormalized) {
-    if (!used.has(message.id)) push(message);
+    if (used.has(message.id)) continue;
+    push(message);
   }
 
   const unchanged =

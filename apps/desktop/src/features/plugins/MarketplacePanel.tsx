@@ -3,12 +3,9 @@ import { IconCheck, IconSearch, IconShield } from "../../components/icons";
 import { MarketplaceSourceSettings } from "../../components/plugins/MarketplaceSourceSettings";
 import { PermissionChips } from "./presentation";
 import {
-  formatBytes,
   formatDate,
   monogram,
   showsVerifiedBadge,
-  versionInstallable,
-  versionWithdrawn,
 } from "./model";
 import type { PluginsPageModel } from "./usePluginsPage";
 
@@ -16,6 +13,7 @@ export function MarketplacePanel({
   t,
   locale,
   settings,
+  marketSource,
   query,
   setQuery,
   refreshMarket,
@@ -203,6 +201,14 @@ export function MarketplacePanel({
                                 name: item.name,
                                 permissions: item.permissionSummary ?? [],
                                 version: item.latestVersion,
+                                expectedMarketplace: item.latestShasum
+                                  ? {
+                                      source: settings?.pluginMarketSource ?? "official",
+                                      catalogUrl: marketSource,
+                                      version: item.latestVersion,
+                                      shasum: item.latestShasum,
+                                    }
+                                  : undefined,
                               })
                             }
                           >

@@ -1,41 +1,15 @@
-fn team_rpc_err(e: anyhow::Error) -> JsonRpcError {
-    let msg = e.to_string();
-    let code_str = if msg.contains("TEAM_DELIVERY_PENDING") {
-        "TEAM_DELIVERY_PENDING"
-    } else if msg.contains("TEAM_UNAUTHORIZED") {
-        "TEAM_UNAUTHORIZED"
-    } else if msg.contains("TEAM_NOT_FOUND") {
-        "TEAM_NOT_FOUND"
-    } else if msg.contains("TEAM_TARGET_NOT_FOUND") {
-        "TEAM_TARGET_NOT_FOUND"
-    } else if msg.contains("TEAM_MEMBER_LIMIT_EXCEEDED") {
-        "TEAM_MEMBER_LIMIT_EXCEEDED"
-    } else if msg.contains("TEAM_MEMBER_NAME_COLLISION") {
-        "TEAM_MEMBER_NAME_COLLISION"
-    } else if msg.contains("TEAM_TASK_NOT_FOUND") {
-        "TEAM_TASK_NOT_FOUND"
-    } else if msg.contains("TEAM_TASK_REVISION_CONFLICT") {
-        "TEAM_TASK_REVISION_CONFLICT"
-    } else if msg.contains("TEAM_TASK_DEPENDENCY_CYCLE") {
-        "TEAM_TASK_DEPENDENCY_CYCLE"
-    } else if msg.contains("TEAM_TASK_UNKNOWN_DEPENDENCY") {
-        "TEAM_TASK_UNKNOWN_DEPENDENCY"
-    } else if msg.contains("TEAM_TASK_LIMIT_EXCEEDED") {
-        "TEAM_TASK_LIMIT_EXCEEDED"
-    } else if msg.contains("TEAM_MAILBOX_FULL") {
-        "TEAM_MAILBOX_FULL"
-    } else if msg.contains("TEAM_MESSAGE_PAYLOAD_TOO_LARGE") {
-        "TEAM_MESSAGE_PAYLOAD_TOO_LARGE"
-    } else if msg.contains("INVALID_PARAMS") {
-        "INVALID_PARAMS"
-    } else {
-        "INTERNAL"
-    };
-    rpc_err(1002, msg, code_str)
-}
 mod config_sync_rpc;
+mod goal_rpc;
+mod plan_schedule_rpc;
 mod scheduled_rpc;
 mod scheduled_tools;
+mod team_rpc;
+mod todos;
+
+#[cfg(test)]
+mod fork_dispatch_tests;
+#[cfg(test)]
+mod project_group_removal_tests;
 
 use std::io::{self, BufRead, BufReader as StdBufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -44,6 +18,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
@@ -65,6 +40,8 @@ use crate::tools::{self, ToolsExecuteParams};
 use crate::transcripts::CompactionRecord;
 use crate::turn_queue;
 use crate::workspace;
+
+use team_rpc::{send_team_changed, team_id_for_participant, team_rpc_err};
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -452,7 +429,13 @@ pub async fn serve(state: Arc<Mutex<AppState>>) -> Result<()> {
 
                 request_tasks.spawn(async move {
                     let _permit = permit;
-                    let out = match handle_request(state, &method, params, tx.clone()).await {
+                    let budget = request_budget_ms(&method, &params);
+                    let out = match with_request_budget(
+                        budget,
+                        handle_request(state, &method, params, tx.clone()),
+                    )
+                    .await
+                    {
                         Ok(result) => JsonRpcResponse {
                             jsonrpc: "2.0",
                             id,
@@ -516,6 +499,90 @@ pub async fn serve(state: Arc<Mutex<AppState>>) -> Result<()> {
     input_error
         .map(|error| Err(anyhow!("{error}")))
         .unwrap_or(Ok(()))
+}
+
+/// Wall-clock budget for a single non-tool RPC request. The JS client gives
+/// its calls ~130s before it rejects locally without ever telling the host
+/// (issue #1071), so a request stuck waiting on the global state lock keeps
+/// its in-flight slot after the caller has moved on. 135s sits just past that
+/// client budget: the slot is guaranteed to come back within seconds of the
+/// client giving up, instead of never.
+const RPC_REQUEST_BUDGET_MS: u64 = 135_000;
+
+/// Grace window added on top of a tool's own effective timeout. A
+/// `tools.execute` may legitimately run for hours (Bash allows up to 6h), so
+/// its budget is derived from the tool timeout rather than the fixed budget;
+/// the grace covers host-side bookkeeping around the actual execution.
+const RPC_TOOL_BUDGET_GRACE_MS: u64 = 90_000;
+
+/// Cap added to the `tools.execute` budget for the permission prompt. Before
+/// the tool runs, the handler may legitimately wait for the user to answer an
+/// ask prompt for tens of seconds — that wait must not eat the tool's own
+/// execution budget, or "slow approval + full-length Bash" would be killed
+/// mid-execution. Unattended callers reject at their own ask budget (~120s),
+/// so the cap matches that order.
+const RPC_PERMISSION_WAIT_CAP_MS: u64 = 120_000;
+
+/// Budget for one request. `tools.execute` follows its own effective tool
+/// timeout (plus permission cap and grace); a tool without an effective
+/// timeout keeps the old unbounded behavior. Every other method gets the
+/// fixed budget.
+fn request_budget_ms(method: &str, params: &Value) -> Option<u64> {
+    if method != "tools.execute" {
+        return Some(RPC_REQUEST_BUDGET_MS);
+    }
+    // `ToolsExecuteParams` is `#[serde(rename_all = "camelCase")]`, so the wire
+    // carries `toolName` / `timeoutMs`. Reading the snake_case spellings here
+    // would see an empty tool name and no timeout on every real request,
+    // leaving tools.execute unbounded again (review on #1208). Accept the
+    // snake_case spelling as a fallback so the helper stays honest about both
+    // shapes.
+    let tool_name = params
+        .get("toolName")
+        .or_else(|| params.get("tool_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let timeout_ms = params
+        .get("timeoutMs")
+        .or_else(|| params.get("timeout_ms"))
+        .and_then(|v| v.as_u64());
+    crate::tools::effective_timeout_ms(tool_name, timeout_ms).map(|timeout| {
+        timeout
+            .saturating_add(RPC_PERMISSION_WAIT_CAP_MS)
+            .saturating_add(RPC_TOOL_BUDGET_GRACE_MS)
+    })
+}
+
+/// Wrap one request's handler future in its wall-clock budget (issue #1071).
+///
+/// The timeout can only fire at an `await` point, so a handler stuck inside a
+/// long *synchronous* call is not interrupted — that class needs the sync work
+/// moved off the async workers instead. What this does guarantee is that a
+/// handler waiting on the global state lock (the dominant queueing case) is
+/// cut loose with its slot, and that one wedged request can no longer hold
+/// every other caller forever: each waiting request fails with its own
+/// `HOST_RPC_TIMEOUT` instead of piling up until `HOST_OVERLOADED`.
+async fn with_request_budget<F>(budget: Option<u64>, fut: F) -> Result<Value, JsonRpcError>
+where
+    F: std::future::Future<Output = Result<Value, JsonRpcError>>,
+{
+    let Some(budget) = budget else {
+        return fut.await;
+    };
+    match tokio::time::timeout(Duration::from_millis(budget), fut).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                budget_ms = budget,
+                "rpc request exceeded its wall-clock budget; slot released"
+            );
+            Err(JsonRpcError {
+                code: -32030,
+                message: format!("host rpc budget of {budget}ms exceeded"),
+                data: Some(json!({ "errorCode": "HOST_RPC_TIMEOUT" })),
+            })
+        }
+    }
 }
 
 fn rpc_err(code: i64, message: impl Into<String>, error_code: &str) -> JsonRpcError {
@@ -800,6 +867,63 @@ fn merge_settings_value(stored: Option<Value>, incoming: Value) -> Value {
     Value::Object(merged)
 }
 
+/// Drop image-generation bindings whose provider row is gone.
+///
+/// `settings.set` merges into the stored object and the shell writes whole
+/// snapshots back, so deleting a provider row used to leave `imageGeneration`
+/// naming an id that no longer resolves. Every `GenerateImages` call then
+/// answered `IMAGE_MODEL_UNAVAILABLE`, and once the candidate list was empty
+/// the settings row that owns the default hid itself, so the binding could
+/// neither run nor be repaired from the UI. A binding that cannot resolve is
+/// therefore not a preference the store keeps: the active default falls back
+/// to "no default" and the candidate list loses that entry, on read and on
+/// write alike. A provider that still exists but is disabled or carries no
+/// credential keeps its binding — that is a state the user repairs in
+/// Settings, and no reference to it is dropped here.
+///
+/// The same rule config sync already enforces when it applies a bundle
+/// (`validate_application_references`), applied to the local settings channel
+/// so a stale id cannot be written into or read out of the store.
+fn prune_unresolvable_image_bindings(
+    db: &crate::db::Database,
+    settings: &mut Value,
+) -> Result<bool> {
+    let Some(object) = settings.as_object_mut() else {
+        return Ok(false);
+    };
+    let resolves = |binding: &Value| -> Result<bool> {
+        match binding.get("providerId").and_then(Value::as_str) {
+            Some(provider_id) => providers::provider_exists(db, provider_id),
+            None => Ok(false),
+        }
+    };
+    let mut changed = false;
+    let active_is_stale = match object.get("imageGeneration") {
+        Some(binding) if !binding.is_null() => !resolves(binding)?,
+        _ => false,
+    };
+    if active_is_stale {
+        object.insert("imageGeneration".into(), Value::Null);
+        changed = true;
+    }
+    if let Some(Value::Array(candidates)) = object.get("imageGenerationModels").cloned() {
+        let mut kept = Vec::with_capacity(candidates.len());
+        let mut dropped = false;
+        for candidate in candidates {
+            if resolves(&candidate)? {
+                kept.push(candidate);
+            } else {
+                dropped = true;
+            }
+        }
+        if dropped {
+            object.insert("imageGenerationModels".into(), Value::Array(kept));
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 fn effective_command_shell_id(settings: Option<&Value>) -> Option<String> {
     let configured = settings
         .and_then(|value| value.get("defaultCommandShell"))
@@ -893,6 +1017,52 @@ fn validate_settings_value(value: &Value) -> Result<(), JsonRpcError> {
             prompt_enhancement_template_error("promptEnhancementUserTemplate", template_value)
         {
             return Err(rpc_err(1002, message, "INVALID_PARAMS"));
+        }
+    }
+    if let Some(preference) = object.get("updatePreference") {
+        if !matches!(preference.as_str(), Some("automatic") | Some("manual")) {
+            return Err(rpc_err(
+                1002,
+                "updatePreference must be automatic or manual",
+                "INVALID_PARAMS",
+            ));
+        }
+    }
+    if let Some(version) = object.get("lastNotifiedUpdateVersion") {
+        let Some(version) = version.as_str() else {
+            return Err(rpc_err(
+                1002,
+                "lastNotifiedUpdateVersion must be a non-empty string",
+                "INVALID_PARAMS",
+            ));
+        };
+        if version.trim().is_empty() || version.len() > 128 {
+            return Err(rpc_err(
+                1002,
+                "lastNotifiedUpdateVersion must contain 1 to 128 characters",
+                "INVALID_PARAMS",
+            ));
+        }
+    }
+    if let Some(version) = object.get("updateDismissedVersion") {
+        match version {
+            serde_json::Value::Null => {}
+            serde_json::Value::String(version) => {
+                if version.trim().is_empty() || version.len() > 128 {
+                    return Err(rpc_err(
+                        1002,
+                        "updateDismissedVersion must contain 1 to 128 characters",
+                        "INVALID_PARAMS",
+                    ));
+                }
+            }
+            _ => {
+                return Err(rpc_err(
+                    1002,
+                    "updateDismissedVersion must be a string or null",
+                    "INVALID_PARAMS",
+                ));
+            }
         }
     }
     if let Some(infinite_retry) = object.get("infiniteProviderRetry") {
@@ -1083,18 +1253,6 @@ fn plan_rpc_err(error: impl ToString) -> JsonRpcError {
         .unwrap_or("PLAN_INTERNAL")
         .to_string();
     rpc_err(1015, message, &error_code)
-}
-
-fn goal_report_rpc_err(error: impl ToString) -> JsonRpcError {
-    let message = error.to_string();
-    if message.starts_with("PERMISSION_DENIED:") {
-        return rpc_err(
-            1007,
-            "goal report was not found for this session",
-            "NOT_FOUND",
-        );
-    }
-    rpc_err(1000, message, "INTERNAL")
 }
 
 fn resolve_persisted_project_workspace(
@@ -1622,475 +1780,17 @@ async fn handle_request(
     }
 
     match method {
-        method if method.starts_with("team.") => {
-            let st = state.lock().await;
-            match method {
-                "team.getRuntimeContext" => {
-                    let session_id = params
-                        .get("sessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "sessionId required", "INVALID_PARAMS"))?;
-                    if sessions::session_execution_profile(&st.db, session_id)
-                        .map_err(team_rpc_err)?
-                        .as_deref()
-                        != Some("team")
-                    {
-                        return Ok(Value::Null);
-                    }
-                    if let Some(member) =
-                        crate::team::get_team_member_by_session_id(&st.db, session_id)
-                            .map_err(team_rpc_err)?
-                    {
-                        let member_name = crate::team::validate_team_participant(
-                            &st.db,
-                            &member.team_session_id,
-                            session_id,
-                        )
-                        .map_err(team_rpc_err)?;
-                        return Ok(json!({
-                            "teamSessionId": member.team_session_id,
-                            "callerSessionId": session_id,
-                            "isLead": false,
-                            "memberName": member_name,
-                        }));
-                    }
-                    crate::team::validate_team_lead(&st.db, session_id).map_err(team_rpc_err)?;
-                    Ok(json!({
-                        "teamSessionId": session_id,
-                        "callerSessionId": session_id,
-                        "isLead": true,
-                    }))
-                }
-                "team.getRoster" => {
-                    let team_id = params
-                        .get("teamSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "teamSessionId required", "INVALID_PARAMS"))?;
-                    let caller_id = params
-                        .get("callerSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            rpc_err(1002, "callerSessionId required", "INVALID_PARAMS")
-                        })?;
-                    crate::team::validate_team_participant(&st.db, team_id, caller_id)
-                        .map_err(team_rpc_err)?;
-                    let members =
-                        crate::team::list_team_members(&st.db, team_id).map_err(team_rpc_err)?;
-                    let team = crate::team::get_team(&st.db, team_id).map_err(team_rpc_err)?;
-                    Ok(json!({
-                        "teamSessionId": team_id,
-                        "revision": team.as_ref().map(|t| t.revision).unwrap_or(1),
-                        "paused": team.as_ref().map(|t| t.paused).unwrap_or(false),
-                        "members": members,
-                    }))
-                }
-                "team.getBoard" => {
-                    let team_id = params
-                        .get("teamSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "teamSessionId required", "INVALID_PARAMS"))?;
-                    let caller_id = params
-                        .get("callerSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            rpc_err(1002, "callerSessionId required", "INVALID_PARAMS")
-                        })?;
-                    crate::team::validate_team_participant(&st.db, team_id, caller_id)
-                        .map_err(team_rpc_err)?;
-                    let projection = crate::team::get_team_board_projection(&st.db, team_id)
-                        .map_err(team_rpc_err)?;
-                    Ok(json!(projection))
-                }
-                "team.createMember" => {
-                    let team_id = params
-                        .get("teamSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "teamSessionId required", "INVALID_PARAMS"))?;
-                    let caller_id = params
-                        .get("callerSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            rpc_err(1002, "callerSessionId required", "INVALID_PARAMS")
-                        })?;
-                    let name = params
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "name required", "INVALID_PARAMS"))?;
-                    let description = params.get("description").and_then(|v| v.as_str());
-                    let context_kind = params.get("contextKind").and_then(|v| v.as_str());
-                    let model_id = params.get("modelId").and_then(|v| v.as_str());
-                    let provider_id = params.get("providerId").and_then(|v| v.as_str());
-                    let member = crate::team::create_team_member(
-                        &st.db,
-                        crate::team::CreateMemberParams {
-                            team_session_id: team_id,
-                            caller_session_id: caller_id,
-                            name,
-                            description,
-                            context_kind,
-                            model_id,
-                            provider_id,
-                        },
-                    )
-                    .map_err(team_rpc_err)?;
-                    Ok(json!({ "member": member }))
-                }
-                "team.createTask" => {
-                    let team_id = params
-                        .get("teamSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "teamSessionId required", "INVALID_PARAMS"))?;
-                    let caller_id = params
-                        .get("callerSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            rpc_err(1002, "callerSessionId required", "INVALID_PARAMS")
-                        })?;
-                    let subject = params
-                        .get("subject")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "subject required", "INVALID_PARAMS"))?;
-                    let task_id = params.get("taskId").and_then(|v| v.as_str());
-                    let description = params.get("description").and_then(|v| v.as_str());
-                    let blocked_by =
-                        params
-                            .get("blockedBy")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|x| x.as_str().map(String::from))
-                                    .collect::<Vec<_>>()
-                            });
-                    let write_scopes =
-                        params
-                            .get("writeScopes")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|x| x.as_str().map(String::from))
-                                    .collect::<Vec<_>>()
-                            });
-                    let owner_session_id = params.get("ownerSessionId").and_then(|v| v.as_str());
-                    let owner_member_name = params.get("ownerMemberName").and_then(|v| v.as_str());
-                    let task = crate::team::create_team_task(
-                        &st.db,
-                        crate::team::CreateTaskParams {
-                            team_session_id: team_id,
-                            caller_session_id: caller_id,
-                            task_id,
-                            subject,
-                            description,
-                            blocked_by,
-                            write_scopes,
-                            owner_session_id,
-                            owner_member_name,
-                        },
-                    )
-                    .map_err(team_rpc_err)?;
-                    Ok(json!({ "task": task }))
-                }
-                "team.updateTask" => {
-                    let team_id = params
-                        .get("teamSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "teamSessionId required", "INVALID_PARAMS"))?;
-                    let caller_id = params
-                        .get("callerSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            rpc_err(1002, "callerSessionId required", "INVALID_PARAMS")
-                        })?;
-                    let task_id = params
-                        .get("taskId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "taskId required", "INVALID_PARAMS"))?;
-                    let expected_revision = params
-                        .get("expectedRevision")
-                        .and_then(|v| v.as_i64())
-                        .ok_or_else(|| {
-                            rpc_err(1002, "expectedRevision required", "INVALID_PARAMS")
-                        })?;
-                    let subject = params.get("subject").and_then(|v| v.as_str());
-                    let description = params.get("description").and_then(|v| v.as_str());
-                    let status = params.get("status").and_then(|v| v.as_str());
-                    let owner_session_id = params.get("ownerSessionId").map(|v| v.as_str());
-                    let owner_member_name = params.get("ownerMemberName").map(|v| v.as_str());
-                    let blocked_by =
-                        params
-                            .get("blockedBy")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|x| x.as_str().map(String::from))
-                                    .collect::<Vec<_>>()
-                            });
-                    let write_scopes =
-                        params
-                            .get("writeScopes")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|x| x.as_str().map(String::from))
-                                    .collect::<Vec<_>>()
-                            });
-                    let deleted = params.get("deleted").and_then(|v| v.as_bool());
-                    let task = crate::team::update_team_task(
-                        &st.db,
-                        crate::team::UpdateTaskParams {
-                            team_session_id: team_id,
-                            caller_session_id: caller_id,
-                            task_id,
-                            expected_revision,
-                            subject,
-                            description,
-                            status,
-                            owner_session_id,
-                            owner_member_name,
-                            blocked_by,
-                            write_scopes,
-                            deleted,
-                        },
-                    )
-                    .map_err(team_rpc_err)?;
-                    Ok(json!({ "task": task }))
-                }
-                "team.sendMessage" => {
-                    let team_id = params
-                        .get("teamSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "teamSessionId required", "INVALID_PARAMS"))?;
-                    let caller_id = params
-                        .get("callerSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            rpc_err(1002, "callerSessionId required", "INVALID_PARAMS")
-                        })?;
-                    let target_id = params
-                        .get("target")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "target required", "INVALID_PARAMS"))?;
-                    let content = params
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "content required", "INVALID_PARAMS"))?;
-                    let idempotency_key = params.get("idempotencyKey").and_then(|v| v.as_str());
-                    let msg = crate::team::send_team_message(
-                        &st.db,
-                        crate::team::SendMessageParams {
-                            team_session_id: team_id,
-                            caller_session_id: caller_id,
-                            target_identifier: target_id,
-                            content,
-                            idempotency_key,
-                        },
-                    )
-                    .map_err(team_rpc_err)?;
-                    send_notification(
-                        &tx,
-                        "team.messageQueued",
-                        json!({ "teamSessionId": team_id, "messageId": msg.id }),
-                    );
-                    Ok(json!({ "message": msg }))
-                }
-                "team.listMessages" => {
-                    let team_id = params
-                        .get("teamSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "teamSessionId required", "INVALID_PARAMS"))?;
-                    let caller_id = params
-                        .get("callerSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            rpc_err(1002, "callerSessionId required", "INVALID_PARAMS")
-                        })?;
-                    let session_id = params
-                        .get("sessionId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(caller_id);
-                    crate::team::validate_team_participant(&st.db, team_id, caller_id)
-                        .map_err(team_rpc_err)?;
-                    crate::team::validate_team_participant(&st.db, team_id, session_id)
-                        .map_err(team_rpc_err)?;
-                    if caller_id != team_id && session_id != caller_id {
-                        return Err(rpc_err(
-                            1001,
-                            "members can only read their own Team messages",
-                            "TEAM_UNAUTHORIZED",
-                        ));
-                    }
-                    let msgs = crate::team::list_member_messages(&st.db, team_id, session_id)
-                        .map_err(team_rpc_err)?;
-                    Ok(json!({ "messages": msgs }))
-                }
-                "team.pendingMessages" => {
-                    let team_id = params
-                        .get("teamSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "teamSessionId required", "INVALID_PARAMS"))?;
-                    let caller_id = params
-                        .get("callerSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            rpc_err(1002, "callerSessionId required", "INVALID_PARAMS")
-                        })?;
-                    crate::team::validate_team_lead(&st.db, team_id).map_err(team_rpc_err)?;
-                    if caller_id != team_id {
-                        return Err(rpc_err(
-                            1001,
-                            "only the team lead can list pending deliveries",
-                            "TEAM_UNAUTHORIZED",
-                        ));
-                    }
-                    let messages = crate::team::list_pending_team_messages(&st.db, team_id)
-                        .map_err(team_rpc_err)?;
-                    Ok(json!({ "messages": messages }))
-                }
-                "team.getMessage" => {
-                    let team_id = params
-                        .get("teamSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "teamSessionId required", "INVALID_PARAMS"))?;
-                    let caller_id = params
-                        .get("callerSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            rpc_err(1002, "callerSessionId required", "INVALID_PARAMS")
-                        })?;
-                    let message_id = params
-                        .get("messageId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "messageId required", "INVALID_PARAMS"))?;
-                    let message =
-                        crate::team::get_team_message(&st.db, team_id, caller_id, message_id)
-                            .map_err(team_rpc_err)?;
-                    Ok(json!({ "message": message }))
-                }
-                "team.ackMessage" => {
-                    let team_id = params
-                        .get("teamSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "teamSessionId required", "INVALID_PARAMS"))?;
-                    let ack_session_id = params
-                        .get("ackSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "ackSessionId required", "INVALID_PARAMS"))?;
-                    let message_id = params
-                        .get("messageId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "messageId required", "INVALID_PARAMS"))?;
-                    let result = params.get("result").and_then(|v| v.as_str());
-                    let acknowledged = crate::team::ack_team_message(
-                        &st.db,
-                        team_id,
-                        ack_session_id,
-                        message_id,
-                        result,
-                    )
-                    .map_err(team_rpc_err)?;
-                    Ok(json!({ "acknowledged": acknowledged }))
-                }
-                "team.interruptMember" => {
-                    let team_id = params
-                        .get("teamSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "teamSessionId required", "INVALID_PARAMS"))?;
-                    let caller_id = params
-                        .get("callerSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            rpc_err(1002, "callerSessionId required", "INVALID_PARAMS")
-                        })?;
-                    if caller_id != team_id {
-                        return Err(rpc_err(
-                            1001,
-                            "only the team lead can interrupt a member",
-                            "TEAM_UNAUTHORIZED",
-                        ));
-                    }
-                    crate::team::validate_team_lead(&st.db, team_id).map_err(team_rpc_err)?;
-                    let member_name = params
-                        .get("memberName")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "memberName required", "INVALID_PARAMS"))?;
-                    let member = crate::team::get_team_member_by_name(&st.db, team_id, member_name)
-                        .map_err(team_rpc_err)?
-                        .ok_or_else(|| {
-                            rpc_err(1002, "Team member not found", "TEAM_TARGET_NOT_FOUND")
-                        })?;
-                    let turn_id = sessions::running_turn_id(&st.db, &member.member_session_id)
-                        .map_err(|error| rpc_err(1000, error.to_string(), "INTERNAL"))?;
-                    if let Some(turn_id) = turn_id {
-                        send_notification(
-                            &tx,
-                            "team.interruptRequested",
-                            json!({ "teamSessionId": team_id, "sessionId": member.member_session_id, "turnId": turn_id }),
-                        );
-                        Ok(json!({ "interrupted": true }))
-                    } else {
-                        Ok(json!({ "interrupted": false }))
-                    }
-                }
-                "team.pause" => {
-                    let team_id = params
-                        .get("teamSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "teamSessionId required", "INVALID_PARAMS"))?;
-                    let caller_id = params
-                        .get("callerSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            rpc_err(1002, "callerSessionId required", "INVALID_PARAMS")
-                        })?;
-                    if caller_id != team_id {
-                        return Err(rpc_err(
-                            1001,
-                            "only the team lead can pause the Team",
-                            "TEAM_UNAUTHORIZED",
-                        ));
-                    }
-                    crate::team::validate_team_lead(&st.db, team_id).map_err(team_rpc_err)?;
-                    let team = crate::team::pause_team(&st.db, team_id).map_err(team_rpc_err)?;
-                    send_notification(
-                        &tx,
-                        "team.queueChanged",
-                        json!({ "teamSessionId": team_id }),
-                    );
-                    Ok(json!({ "team": team }))
-                }
-                "team.resume" => {
-                    let team_id = params
-                        .get("teamSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| rpc_err(1002, "teamSessionId required", "INVALID_PARAMS"))?;
-                    let caller_id = params
-                        .get("callerSessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            rpc_err(1002, "callerSessionId required", "INVALID_PARAMS")
-                        })?;
-                    if caller_id != team_id {
-                        return Err(rpc_err(
-                            1001,
-                            "only the team lead can resume the Team",
-                            "TEAM_UNAUTHORIZED",
-                        ));
-                    }
-                    crate::team::validate_team_lead(&st.db, team_id).map_err(team_rpc_err)?;
-                    let team = crate::team::resume_team(&st.db, team_id).map_err(team_rpc_err)?;
-                    send_notification(
-                        &tx,
-                        "team.queueChanged",
-                        json!({ "teamSessionId": team_id }),
-                    );
-                    Ok(json!({ "team": team }))
-                }
-                _ => Err(rpc_err(
-                    1004,
-                    format!("unknown method: {method}"),
-                    "METHOD_NOT_FOUND",
-                )),
-            }
+        method if method.starts_with("team.") => team_rpc::handle(state, method, params, tx).await,
+        method if method.starts_with("goalReports.") || method.starts_with("goalProgress.") => {
+            goal_rpc::handle(state, method, params, tx).await
         }
+        "plans.markMissedSchedules"
+        | "plans.dueSchedules"
+        | "plans.claimSchedule"
+        | "plans.cancelSchedule"
+        | "plans.markScheduleMissed"
+        | "plans.markRevisionFailed"
+        | "session.getTurn" => plan_schedule_rpc::handle(state, method, params, tx).await,
         method if method.starts_with("session.collaboration.") => {
             let st = state.lock().await;
             crate::session_collaboration::handle(&st.db, method, &params)
@@ -2359,27 +2059,6 @@ async fn handle_request(
                     "CONFLICT",
                 ));
             }
-            // A path that belongs to a multi-folder project group must stay put:
-            // deleting one root would orphan the rest of the group, so callers
-            // remove the folder from the group first. A single-folder stored
-            // group is just a wrapper around one project, so removing that
-            // project also removes the now-empty group record.
-            if let Some(group) = st
-                .db
-                .stored_project_group_for_path(&path)
-                .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?
-            {
-                if group.roots.len() > 1 {
-                    return Err(rpc_err(
-                        1002,
-                        "project belongs to a multi-folder project group; remove the folder from the group first",
-                        "INVALID_PARAMS",
-                    ));
-                }
-                st.db
-                    .delete_project_group_record(&group.id)
-                    .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
-            }
             let session_ids = st
                 .db
                 .project_session_ids(&path)
@@ -2393,16 +2072,84 @@ async fn handle_request(
                 {
                     return Err(rpc_err(1008, "project has running sessions", "CONFLICT"));
                 }
+                if plans::has_live_scratch_goal(&st.db, id)
+                    .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?
+                {
+                    return Err(plan_rpc_err("PLAN_CONFIGURATION_BLOCKED"));
+                }
+                if let Some(member) =
+                    crate::team::get_team_member_by_session_id(&st.db, id).map_err(team_rpc_err)?
+                {
+                    if !session_ids.contains(&member.team_session_id) {
+                        crate::team::can_delete_session(&st.db, id).map_err(|error| {
+                            let message = error.to_string();
+                            if message.starts_with("TEAM_MEMBER_DELETION_BLOCKED:") {
+                                rpc_err(1002, message, "TEAM_MEMBER_DELETION_BLOCKED")
+                            } else {
+                                rpc_err(1000, message, "INTERNAL")
+                            }
+                        })?;
+                    }
+                }
             }
+            // Check for a running session before changing group membership.
+            // A busy project must remain in its original group.
+            // Once the project is known to be idle, detach its root as part of
+            // this delete because the group editor keeps its primary root
+            // fixed and preserves chats on detached non-primary roots (#1358).
+            // If the primary is removed, the first remaining root becomes primary. A
+            // single-folder group is just a wrapper around one project, so
+            // deleting that project also removes the now-empty group record.
+            if let Some(group) = st
+                .db
+                .stored_project_group_for_path(&path)
+                .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?
+            {
+                if group.roots.len() > 1 {
+                    st.db
+                        .remove_project_from_group(&group.id, &path)
+                        .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
+                } else {
+                    st.db
+                        .delete_project_group_record(&group.id)
+                        .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
+                }
+            }
+            let mut lead_ids = Vec::new();
+            for id in &session_ids {
+                if crate::team::get_team(&st.db, id)
+                    .map_err(team_rpc_err)?
+                    .is_some()
+                {
+                    lead_ids.push(id.clone());
+                }
+            }
+            let mut ordered_session_ids = lead_ids.clone();
+            ordered_session_ids.extend(
+                session_ids
+                    .iter()
+                    .filter(|id| !lead_ids.contains(id))
+                    .cloned(),
+            );
             crate::scheduled::project::pause(&st.db, &path)
                 .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
             let mut sessions_removed = 0;
-            for id in &session_ids {
-                if sessions::delete_session(&st.db, id)
-                    .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?
-                {
+            for id in &ordered_session_ids {
+                let team_before_delete = crate::team::get_team(&st.db, id).map_err(team_rpc_err)?;
+                if sessions::delete_session_with_team_cleanup(&st.db, id).map_err(plan_rpc_err)? {
                     drop_session_side_data(&st, id);
                     sessions_removed += 1;
+                    if let Some(team) = team_before_delete {
+                        send_notification(
+                            &tx,
+                            "team.changed",
+                            json!({
+                                "teamSessionId": id,
+                                "revision": team.revision.saturating_add(1),
+                                "reason": "dissolved",
+                            }),
+                        );
+                    }
                 }
             }
             let removed = st
@@ -2525,7 +2272,7 @@ async fn handle_request(
                 .db
                 .get_setting("app")
                 .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
-            Ok(normalize_settings_value(stored.unwrap_or_else(|| {
+            let mut settings = normalize_settings_value(stored.unwrap_or_else(|| {
                 json!({
                     "defaultMode": "agent",
                     "defaultCommandShell": tools::shell::default_shell_id(),
@@ -2539,7 +2286,19 @@ async fn handle_request(
                     },
                     "onboardingDismissed": false
                 })
-            })))
+            }));
+            // Repair on read: a binding whose provider row is already gone —
+            // deleted by a build that did not prune, an uninstalled plugin, or
+            // synced bundle — is dropped here and the store is corrected, so
+            // the shell never presents a default the runtime must reject.
+            if prune_unresolvable_image_bindings(&st.db, &mut settings)
+                .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?
+            {
+                st.db
+                    .set_setting("app", &settings)
+                    .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
+            }
+            Ok(settings)
         }
         "settings.set" => {
             validate_settings_value(&params)?;
@@ -2554,7 +2313,9 @@ async fn handle_request(
             {
                 gate_default_command_shell_setting(&st)?;
             }
-            let settings = normalize_settings_value(merge_settings_value(stored, params));
+            let mut settings = normalize_settings_value(merge_settings_value(stored, params));
+            prune_unresolvable_image_bindings(&st.db, &mut settings)
+                .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
             st.db
                 .set_setting("app", &settings)
                 .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
@@ -2791,36 +2552,39 @@ async fn handle_request(
                     ))
                 }
             };
-            let session = sessions::create_session_with_options(
-                &st.db,
-                sessions::SessionCreateOptions {
-                    title: params
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    mode: params
-                        .get("mode")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    provider_id: params
-                        .get("providerId")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    model_id: params
-                        .get("modelId")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    project_path: params
-                        .get("projectPath")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    project_name,
-                    thinking_level,
-                    permission_mode,
-                    execution_profile,
-                },
-            )
-            .map_err(|e| session_naming_rpc_err(e))?;
+            let create_team_record = execution_profile.as_deref() == Some("team");
+            let options = sessions::SessionCreateOptions {
+                title: params
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                mode: params
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                provider_id: params
+                    .get("providerId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                model_id: params
+                    .get("modelId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                project_path: params
+                    .get("projectPath")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                project_name,
+                thinking_level,
+                permission_mode,
+                execution_profile,
+            };
+            let session = if create_team_record {
+                sessions::create_team_lead_session_with_options(&st.db, options)
+            } else {
+                sessions::create_session_with_options(&st.db, options)
+            }
+            .map_err(session_naming_rpc_err)?;
             Ok(json!({ "session": session }))
         }
         "session.fork" => {
@@ -2923,29 +2687,15 @@ async fn handle_request(
             .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
             Ok(json!({ "session": session }))
         }
-        "session.getTurn" => {
+        "todos.get" => {
             let session_id = params
                 .get("sessionId")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| rpc_err(1002, "sessionId required", "INVALID_PARAMS"))?;
-            let turn_id = params
-                .get("turnId")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| rpc_err(1002, "turnId required", "INVALID_PARAMS"))?;
+                .and_then(Value::as_str)
+                .ok_or_else(|| rpc_err(1002, "sessionId required", "INVALID_ARGUMENT"))?;
             let st = state.lock().await;
-            let turn = sessions::get_turn_state(&st.db, session_id, turn_id)
-                .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
-            match turn {
-                Some(turn) => {
-                    serde_json::to_value(turn).map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))
-                }
-                None => Err(rpc_err(1007, "turn not found", "NOT_FOUND")),
-            }
+            todos::get_from(&st, session_id)
         }
+
         "session.configure" => {
             let id = params
                 .get("id")
@@ -2982,6 +2732,8 @@ async fn handle_request(
                 let message = e.to_string();
                 if message.starts_with("PLAN_") {
                     plan_rpc_err(message)
+                } else if message.starts_with("TEAM_") {
+                    team_rpc_err(e)
                 } else {
                     rpc_err(1002, message, "INVALID_PARAMS")
                 }
@@ -2995,6 +2747,7 @@ async fn handle_request(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| rpc_err(1002, "id required", "INVALID_PARAMS"))?;
             let st = state.lock().await;
+            let team_before_delete = crate::team::get_team(&st.db, id).map_err(team_rpc_err)?;
             crate::team::can_delete_session(&st.db, id).map_err(|error| {
                 let message = error.to_string();
                 if message.starts_with("TEAM_MEMBER_DELETION_BLOCKED:") {
@@ -3003,11 +2756,21 @@ async fn handle_request(
                     rpc_err(1000, message, "INTERNAL")
                 }
             })?;
-            crate::team::cleanup_team_on_lead_delete(&st.db, id)
-                .map_err(|error| rpc_err(1000, error.to_string(), "INTERNAL"))?;
-            let ok = sessions::delete_session(&st.db, id).map_err(plan_rpc_err)?;
+            let ok =
+                sessions::delete_session_with_team_cleanup(&st.db, id).map_err(plan_rpc_err)?;
             if ok {
                 drop_session_side_data(&st, id);
+                if let Some(team) = team_before_delete {
+                    send_notification(
+                        &tx,
+                        "team.changed",
+                        json!({
+                            "teamSessionId": id,
+                            "revision": team.revision.saturating_add(1),
+                            "reason": "dissolved",
+                        }),
+                    );
+                }
             }
             Ok(json!({ "ok": ok }))
         }
@@ -3023,8 +2786,54 @@ async fn handle_request(
             let title = sessions::normalize_session_title(title)
                 .map_err(|e| rpc_err(1002, e.to_string(), "INVALID_PARAMS"))?;
             let st = state.lock().await;
-            let ok = sessions::rename_session(&st.db, id, &title)
-                .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
+            let expected_title = match params.get("expectedTitle") {
+                Some(Value::String(value)) => Some(value.as_str()),
+                Some(_) => {
+                    return Err(rpc_err(
+                        1002,
+                        "expectedTitle must be a string",
+                        "INVALID_PARAMS",
+                    ))
+                }
+                None => None,
+            };
+            let expected_execution_id = match params.get("expectedExecutionId") {
+                Some(Value::Null) => Some(None),
+                Some(Value::String(value)) => Some(Some(value.as_str())),
+                Some(_) => {
+                    return Err(rpc_err(
+                        1002,
+                        "expectedExecutionId must be a string or null",
+                        "INVALID_PARAMS",
+                    ))
+                }
+                None => None,
+            };
+            let ok = if let Some(expected_title) = expected_title {
+                sessions::rename_session_guarded(
+                    &st.db,
+                    id,
+                    &title,
+                    expected_title,
+                    expected_execution_id,
+                )
+                .map_err(|error| {
+                    if error.to_string().starts_with("CONFLICT:") {
+                        rpc_err(1003, error.to_string(), "CONFLICT")
+                    } else {
+                        rpc_err(1000, error.to_string(), "INTERNAL")
+                    }
+                })?
+            } else if expected_execution_id.is_some() {
+                return Err(rpc_err(
+                    1002,
+                    "expectedTitle required with expectedExecutionId",
+                    "INVALID_PARAMS",
+                ));
+            } else {
+                sessions::rename_session(&st.db, id, &title)
+                    .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?
+            };
             Ok(json!({ "ok": ok }))
         }
         "session.appendMessage" => {
@@ -3378,6 +3187,8 @@ async fn handle_request(
                         "INVALID_PARAMS",
                     ));
                 }
+                crate::team::review::gate_team_member_turn(&st.db, session_id, provider, model)
+                    .map_err(team_rpc_err)?;
                 let content = params
                     .get("revisionContent")
                     .and_then(Value::as_str)
@@ -3397,6 +3208,9 @@ async fn handle_request(
                         model_id,
                     )
                     .map_err(plan_rpc_err)?;
+                if let Some(team_id) = team_id_for_participant(&st.db, session_id)? {
+                    send_team_changed(&st.db, &tx, &team_id, "activity")?;
+                }
                 return Ok(json!({ "turnId": turn_id, "alreadyStarted": already_started }));
             }
             let turn_id = match params.get("sessionMessageId").and_then(Value::as_str) {
@@ -3405,8 +3219,34 @@ async fn handle_request(
                 ),
                 None => sessions::begin_turn(&st.db, session_id, provider, model),
             }
-            .map_err(session_collaboration_rpc_err)?;
+            .map_err(|error| {
+                if error.to_string().starts_with("TEAM_") {
+                    team_rpc_err(error)
+                } else {
+                    session_collaboration_rpc_err(error)
+                }
+            })?;
+            if let Some(team_id) = team_id_for_participant(&st.db, session_id)? {
+                send_team_changed(&st.db, &tx, &team_id, "activity")?;
+            }
             Ok(json!({ "turnId": turn_id }))
+        }
+        "session.recordUsage" => {
+            let session_id = params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| rpc_err(1002, "sessionId required", "INVALID_PARAMS"))?;
+            let turn_id = params
+                .get("turnId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| rpc_err(1002, "turnId required", "INVALID_PARAMS"))?;
+            let usage = params
+                .get("usage")
+                .ok_or_else(|| rpc_err(1002, "usage required", "INVALID_PARAMS"))?;
+            let st = state.lock().await;
+            let recorded = sessions::record_usage(&st.db, session_id, turn_id, usage)
+                .map_err(|e| rpc_err(1002, e.to_string(), "INVALID_PARAMS"))?;
+            Ok(json!({ "ok": recorded }))
         }
         "session.endTurn" => {
             let turn_id = params
@@ -3435,6 +3275,23 @@ async fn handle_request(
                         .unwrap_or(false),
                 )
                 .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
+                if result.updated {
+                    let turn_session_id: Option<String> = st
+                        .db
+                        .conn()
+                        .query_row(
+                            "SELECT session_id FROM turns WHERE id=?1",
+                            [turn_id],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
+                    if let Some(session_id) = turn_session_id {
+                        if let Some(team_id) = team_id_for_participant(&st.db, &session_id)? {
+                            send_team_changed(&st.db, &tx, &team_id, "activity")?;
+                        }
+                    }
+                }
                 let revision = if result.updated {
                     let code = match status {
                         "error" => "PLAN_REVISION_TURN_FAILED",
@@ -3963,230 +3820,6 @@ async fn handle_request(
                 .map_err(plan_rpc_err)?;
             Ok(json!({ "executions": executions }))
         }
-        "plans.markMissedSchedules" => {
-            let now = params
-                .get("nowMs")
-                .and_then(|v| v.as_i64())
-                .unwrap_or_else(crate::db::now_ms);
-            let (proposal_ids, proposals) = {
-                let st = state.lock().await;
-                let proposal_ids = st
-                    .plans
-                    .mark_overdue_schedules_missed(&st.db, now)
-                    .map_err(plan_rpc_err)?;
-                let proposals = proposal_ids
-                    .iter()
-                    .map(|id| {
-                        plans::get_proposal(&st.db, id)
-                            .map_err(plan_rpc_err)?
-                            .ok_or_else(|| plan_rpc_err("PLAN_NOT_FOUND"))
-                    })
-                    .collect::<std::result::Result<Vec<_>, JsonRpcError>>()?;
-                (proposal_ids, proposals)
-            };
-            for proposal in proposals {
-                emit_notification(
-                    &tx,
-                    "plans.changed",
-                    json!({
-                        "sessionId": proposal.session_id,
-                        "proposalId": proposal.id,
-                        "state": "inactive",
-                        "kind": proposal.kind,
-                        "proposal": proposal,
-                    }),
-                )
-                .await;
-            }
-            Ok(json!({ "proposalIds": proposal_ids }))
-        }
-        "plans.dueSchedules" => {
-            let now = params
-                .get("nowMs")
-                .and_then(|v| v.as_i64())
-                .unwrap_or_else(crate::db::now_ms);
-            let st = state.lock().await;
-            let proposal_ids = st.plans.due_schedules(&st.db, now).map_err(plan_rpc_err)?;
-            let schedules = proposal_ids
-                .iter()
-                .map(|id| {
-                    let proposal = plans::get_proposal(&st.db, id)
-                        .map_err(plan_rpc_err)?
-                        .ok_or_else(|| plan_rpc_err("PLAN_NOT_FOUND"))?;
-                    Ok(json!({ "proposalId": id, "sessionId": proposal.session_id }))
-                })
-                .collect::<std::result::Result<Vec<_>, JsonRpcError>>()?;
-            Ok(json!({ "schedules": schedules }))
-        }
-        "plans.claimSchedule" => {
-            let proposal_id = params
-                .get("proposalId")
-                .and_then(|v| v.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "proposalId required", "INVALID_PARAMS"))?;
-            let session_id = params
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "sessionId required", "INVALID_PARAMS"))?;
-            let now = params
-                .get("nowMs")
-                .and_then(|v| v.as_i64())
-                .unwrap_or_else(crate::db::now_ms);
-            let allow_missed = params
-                .get("allowMissed")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let execution = {
-                let st = state.lock().await;
-                let proposal = plans::get_proposal(&st.db, proposal_id)
-                    .map_err(plan_rpc_err)?
-                    .ok_or_else(|| plan_rpc_err("PLAN_NOT_FOUND"))?;
-                if proposal.session_id != session_id {
-                    return Err(plan_rpc_err("PLAN_APPROVAL_STALE"));
-                }
-                st.plans
-                    .claim_schedule(&st.db, proposal_id, now, allow_missed)
-                    .map_err(plan_rpc_err)?
-            };
-            emit_notification(
-                &tx,
-                "plans.changed",
-                json!({
-                    "sessionId": execution.session_id,
-                    "proposalId": execution.proposal_id,
-                    "state": "inactive",
-                    "kind": execution.kind,
-                    "execution": execution,
-                }),
-            )
-            .await;
-            Ok(json!({ "execution": execution }))
-        }
-        "plans.cancelSchedule" => {
-            let proposal_id = params
-                .get("proposalId")
-                .and_then(|v| v.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "proposalId required", "INVALID_PARAMS"))?;
-            let session_id = params
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "sessionId required", "INVALID_PARAMS"))?;
-            let (cancelled, proposal) = {
-                let st = state.lock().await;
-                let proposal = plans::get_proposal(&st.db, proposal_id)
-                    .map_err(plan_rpc_err)?
-                    .ok_or_else(|| plan_rpc_err("PLAN_NOT_FOUND"))?;
-                if proposal.session_id != session_id {
-                    return Err(plan_rpc_err("PLAN_APPROVAL_STALE"));
-                }
-                let cancelled = st
-                    .plans
-                    .cancel_schedule(&st.db, proposal_id)
-                    .map_err(plan_rpc_err)?;
-                let proposal = plans::get_proposal(&st.db, proposal_id).map_err(plan_rpc_err)?;
-                (cancelled, proposal)
-            };
-            if cancelled {
-                if let Some(ref proposal) = proposal {
-                    emit_notification(
-                        &tx,
-                        "plans.changed",
-                        json!({
-                            "sessionId": proposal.session_id,
-                            "proposalId": proposal.id,
-                            "state": "inactive",
-                            "kind": proposal.kind,
-                            "proposal": proposal,
-                        }),
-                    )
-                    .await;
-                }
-            }
-            Ok(json!({ "cancelled": cancelled, "proposal": proposal }))
-        }
-        "plans.markScheduleMissed" => {
-            let proposal_id = params
-                .get("proposalId")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "proposalId required", "INVALID_PARAMS"))?;
-            let session_id = params
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "sessionId required", "INVALID_PARAMS"))?;
-            let (changed, proposal) = {
-                let st = state.lock().await;
-                let proposal = plans::get_proposal(&st.db, proposal_id)
-                    .map_err(plan_rpc_err)?
-                    .ok_or_else(|| plan_rpc_err("PLAN_NOT_FOUND"))?;
-                if proposal.session_id != session_id {
-                    return Err(plan_rpc_err("PLAN_APPROVAL_STALE"));
-                }
-                let changed = st
-                    .plans
-                    .miss_schedule(&st.db, proposal_id, crate::db::now_ms())
-                    .map_err(plan_rpc_err)?;
-                let updated = plans::get_proposal(&st.db, proposal_id).map_err(plan_rpc_err)?;
-                (changed, updated)
-            };
-            if changed {
-                if let Some(ref proposal) = proposal {
-                    emit_notification(
-                        &tx,
-                        "plans.changed",
-                        json!({
-                            "sessionId": session_id, "proposalId": proposal_id,
-                            "state": "inactive", "kind": proposal.kind, "proposal": proposal,
-                        }),
-                    )
-                    .await;
-                }
-            }
-            Ok(json!({ "changed": changed, "proposal": proposal }))
-        }
-        "plans.markRevisionFailed" => {
-            let proposal_id = params
-                .get("proposalId")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "proposalId required", "INVALID_PARAMS"))?;
-            let session_id = params
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "sessionId required", "INVALID_PARAMS"))?;
-            let error_code = params
-                .get("errorCode")
-                .and_then(Value::as_str)
-                .unwrap_or("PLAN_REVISION_FAILED");
-            let (changed, proposal) = {
-                let st = state.lock().await;
-                let changed = st
-                    .plans
-                    .mark_revision_failed(&st.db, proposal_id, session_id, error_code)
-                    .map_err(plan_rpc_err)?;
-                let proposal = plans::get_proposal(&st.db, proposal_id).map_err(plan_rpc_err)?;
-                (changed, proposal)
-            };
-            if changed {
-                if let Some(ref proposal) = proposal {
-                    emit_notification(
-                        &tx,
-                        "plans.changed",
-                        json!({
-                            "sessionId": session_id, "proposalId": proposal_id,
-                            "state": "planning", "kind": proposal.kind, "proposal": proposal,
-                        }),
-                    )
-                    .await;
-                }
-            }
-            Ok(json!({ "changed": changed, "proposal": proposal }))
-        }
         "plans.claimExecution" => {
             let execution_id = params
                 .get("executionId")
@@ -4280,202 +3913,6 @@ async fn handle_request(
                 .await;
             }
             Ok(json!({ "ok": true, "changed": changed }))
-        }
-        "goalReports.bindExecutionTurn" => {
-            let execution_id = params
-                .get("executionId")
-                .and_then(|v| v.as_str())
-                .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "executionId required", "INVALID_PARAMS"))?;
-            let turn_id = params
-                .get("turnId")
-                .and_then(|v| v.as_str())
-                .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "turnId required", "INVALID_PARAMS"))?;
-            let st = state.lock().await;
-            crate::goal_reports::bind_execution_turn(&st.db, execution_id, turn_id)
-                .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
-            Ok(json!({ "ok": true }))
-        }
-        "goalReports.markFailed" => {
-            let session_id = params
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "sessionId required", "INVALID_PARAMS"))?;
-            let execution_id = params
-                .get("executionId")
-                .and_then(|v| v.as_str())
-                .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "executionId required", "INVALID_PARAMS"))?;
-            let error_code = params
-                .get("errorCode")
-                .and_then(|v| v.as_str())
-                .filter(|code| !code.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "errorCode required", "INVALID_PARAMS"))?;
-            let summary = {
-                let st = state.lock().await;
-                crate::goal_reports::mark_failed(&st.db, session_id, execution_id, error_code)
-                    .map_err(goal_report_rpc_err)?
-            };
-            emit_notification(
-                &tx,
-                "goalReports.changed",
-                json!({
-                    "sessionId": summary.session_id,
-                    "reportId": summary.report_id,
-                    "executionId": summary.execution_id,
-                    "proposalId": summary.proposal_id,
-                    "status": summary.status,
-                    "integrity": summary.integrity,
-                    "verdict": summary.verdict,
-                }),
-            )
-            .await;
-            Ok(json!({ "report": summary }))
-        }
-        "goalReports.invalidateDraft" => {
-            let execution_id = params
-                .get("executionId")
-                .and_then(|v| v.as_str())
-                .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "executionId required", "INVALID_PARAMS"))?;
-            let st = state.lock().await;
-            crate::goal_reports::invalidate_draft(&st.db, execution_id)
-                .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
-            Ok(json!({ "ok": true }))
-        }
-        "goalReports.submitDraft" => {
-            let execution_id = params
-                .get("executionId")
-                .and_then(|v| v.as_str())
-                .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "executionId required", "INVALID_PARAMS"))?;
-            let draft = params
-                .get("draft")
-                .ok_or_else(|| rpc_err(1002, "draft required", "INVALID_PARAMS"))?;
-            let st = state.lock().await;
-            crate::goal_reports::submit_draft(&st.db, execution_id, draft)
-                .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
-            Ok(json!({ "ok": true }))
-        }
-        "goalReports.finalizeReport" => {
-            let execution_id = params
-                .get("executionId")
-                .and_then(|v| v.as_str())
-                .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "executionId required", "INVALID_PARAMS"))?;
-            let durable_seq = params
-                .get("durableSeq")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let status = params.get("status").and_then(|v| v.as_str());
-            let error_code = params.get("errorCode").and_then(|v| v.as_str());
-            let summary = {
-                let st = state.lock().await;
-                crate::goal_reports::finalize_report(
-                    &st.db,
-                    execution_id,
-                    durable_seq,
-                    status,
-                    error_code,
-                )
-                .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?
-            };
-            emit_notification(
-                &tx,
-                "goalReports.changed",
-                json!({
-                    "sessionId": summary.session_id,
-                    "reportId": summary.report_id,
-                    "executionId": summary.execution_id,
-                    "proposalId": summary.proposal_id,
-                    "status": summary.status,
-                    "integrity": summary.integrity,
-                    "verdict": summary.verdict,
-                }),
-            )
-            .await;
-            Ok(json!({ "report": summary }))
-        }
-        "goalReports.get" => {
-            let session_id = params
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "sessionId required", "INVALID_PARAMS"))?;
-            let report_id = params
-                .get("reportId")
-                .or_else(|| params.get("executionId"))
-                .and_then(|v| v.as_str())
-                .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| {
-                    rpc_err(1002, "reportId or executionId required", "INVALID_PARAMS")
-                })?;
-            let st = state.lock().await;
-            // Trusted read: recomputes the file hash/size from disk, validates
-            // schema and identity, and reports an explicit state instead of a
-            // stale DB hash or an unvalidated body.
-            let read = crate::goal_reports::read_report(&st.db, session_id, report_id)
-                .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
-            let is_ready = read.state == crate::goal_reports::REPORT_STATE_READY;
-            let body = if is_ready {
-                read.report.clone()
-            } else {
-                Some(crate::goal_reports::state_stub(&read))
-            };
-            Ok(json!({
-                "report": body,
-                "state": read.state,
-                "reportSha256": read.report_sha256,
-                "fileBytes": read.file_bytes,
-                "maxBytes": read.max_bytes,
-                "integrity": read.integrity,
-                "verdict": read.verdict,
-                "detail": read.detail,
-            }))
-        }
-        "goalReports.list" => {
-            let session_id = params
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| rpc_err(1002, "sessionId required", "INVALID_PARAMS"))?;
-            let st = state.lock().await;
-            let reports = crate::goal_reports::list_reports(&st.db, session_id)
-                .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
-            Ok(json!({ "reports": reports }))
-        }
-        "goalReports.retry" => {
-            let session_id = params
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "sessionId required", "INVALID_PARAMS"))?;
-            let execution_id = params
-                .get("executionId")
-                .and_then(|v| v.as_str())
-                .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| rpc_err(1002, "executionId required", "INVALID_PARAMS"))?;
-            let summary = {
-                let st = state.lock().await;
-                crate::goal_reports::retry_report(&st.db, session_id, execution_id)
-                    .map_err(goal_report_rpc_err)?
-            };
-            emit_notification(
-                &tx,
-                "goalReports.changed",
-                json!({
-                    "sessionId": summary.session_id,
-                    "reportId": summary.report_id,
-                    "executionId": summary.execution_id,
-                    "proposalId": summary.proposal_id,
-                    "status": summary.status,
-                    "integrity": summary.integrity,
-                    "verdict": summary.verdict,
-                }),
-            )
-            .await;
-            Ok(json!({ "report": summary }))
         }
 
         method if method.starts_with("scheduled.") => {
@@ -4593,7 +4030,6 @@ async fn handle_request(
                     if st.shutting_down {
                         return Err(rpc_err(1001, "host is shutting down", "HOST_SHUTTING_DOWN"));
                     }
-                    st.permissions.expire_stale();
                     // Effective permission mode (D115): per-session override
                     // unless it is `inherit`, then the global settings default,
                     // then `ask`. A subagent's tool call carries its own scope
@@ -4741,8 +4177,7 @@ async fn handle_request(
                             "toolName": req.tool_name,
                             "risk": req.risk,
                             "argsPreview": req.args_preview,
-                            "reason": req.reason,
-                            "timeoutMs": req.timeout_ms
+                            "reason": req.reason
                         });
                         if let Some(shell_id) = req.command_shell_id.as_deref() {
                             permission_params["commandShellId"] = json!(shell_id);
@@ -4768,14 +4203,9 @@ async fn handle_request(
                         d
                     }
                 } else if let Some(rx) = pending_rx {
-                    let permission_wait = tokio::time::timeout(
-                        std::time::Duration::from_millis(crate::permissions::PERMISSION_TIMEOUT_MS),
-                        rx,
-                    );
-                    tokio::pin!(permission_wait);
                     tokio::select! {
-                        outcome = &mut permission_wait => match outcome {
-                            Ok(Ok(d)) => d,
+                        outcome = rx => match outcome {
+                            Ok(d) => d,
                             _ => PermissionDecision::Deny,
                         },
                         _ = wait_for_bash_cancellation(&mut permission_cancellation) => {
@@ -4976,7 +4406,11 @@ async fn handle_request(
                     });
                 }
 
-                let mut result = if tools::is_desktop_dispatched(&p.tool_name) {
+                let mut result = if p.tool_name == "TodoWrite" {
+                    // The checklist body owns its own trusted-transport checks,
+                    // the atomic write, and the after-commit notification.
+                    todos::execute_write(&state, &tx, &p, call_started).await?
+                } else if tools::is_desktop_dispatched(&p.tool_name) {
                     // Plugin and MCP dispatch has its own bounded default, sized
                     // to outlast Electron's budgets; command-shell timeout
                     // semantics apply only to Bash.
@@ -5390,6 +4824,9 @@ async fn handle_request(
                         enable,
                         marketplace: None,
                         expected_shasum: None,
+                        expected_plugin_id: None,
+                        expected_version: None,
+                        expected_marketplace: None,
                         auto_update: false,
                         granted_permissions: granted,
                     },
@@ -5424,6 +4861,9 @@ async fn handle_request(
                         enable,
                         marketplace: None,
                         expected_shasum,
+                        expected_plugin_id: None,
+                        expected_version: None,
+                        expected_marketplace: None,
                         auto_update: false,
                         granted_permissions: granted,
                     },
@@ -5797,6 +5237,9 @@ async fn handle_request(
                 .get("grantedPermissions")
                 .cloned()
                 .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok());
+            let expected_marketplace = params.get("expectedMarketplace").cloned().and_then(|v| {
+                serde_json::from_value::<crate::plugins::ExpectedMarketplace>(v).ok()
+            });
             // An install outlives one request from the interface's point of
             // view: it resolves where the package is, downloads it from one
             // mirror after another, verifies it and registers it. Every one of
@@ -5820,6 +5263,7 @@ async fn handle_request(
                 enable,
                 auto_update,
                 granted,
+                expected_marketplace.as_ref(),
                 &mut observer,
             );
             // Whatever happened, nothing is cancellable any more: a token left
@@ -5927,8 +5371,9 @@ mod tests {
 
     use super::{
         capability_err, handle_request, parse_capability_query, parse_capability_target,
-        peek_jsonrpc_id, provider_rpc_err, resolve_plan_workspace, resolve_tool_workspace,
-        resolve_tool_workspace_for_call, scope_err, skill_err,
+        peek_jsonrpc_id, provider_rpc_err, request_budget_ms, resolve_plan_workspace,
+        resolve_tool_workspace, resolve_tool_workspace_for_call, scope_err, skill_err,
+        with_request_budget, JsonRpcError, RPC_REQUEST_BUDGET_MS,
     };
     use crate::agent_capabilities::CapabilityLevel;
     use crate::plans;
@@ -5936,6 +5381,209 @@ mod tests {
     use crate::scheduled;
     use crate::sessions;
     use crate::state::AppState;
+    use std::time::Duration;
+
+    // Issue #1071: the per-request wall-clock budget must cut loose requests
+    // stuck on the global state lock (the dominant queueing case) so their
+    // in-flight slots come back, without ever shortening a legitimate
+    // long-running tool execution.
+
+    #[test]
+    fn request_budget_is_fixed_for_non_tool_methods() {
+        assert_eq!(
+            request_budget_ms("session.get", &json!({})),
+            Some(RPC_REQUEST_BUDGET_MS)
+        );
+        assert_eq!(
+            request_budget_ms("providers.list", &json!({})),
+            Some(RPC_REQUEST_BUDGET_MS)
+        );
+    }
+
+    #[test]
+    fn request_budget_for_tools_execute_follows_tool_timeout() {
+        // The real wire shape: ToolsExecuteParams is serde-renamed to
+        // camelCase, so the runtime sends toolName / timeoutMs (review on
+        // #1208 — the snake_case spellings are never on the wire).
+        let bash = json!({"toolName": "Bash", "timeoutMs": 60000});
+        assert_eq!(
+            request_budget_ms("tools.execute", &bash),
+            Some(60_000 + 120_000 + 90_000)
+        );
+        // Bash without an explicit timeout falls back to the Bash default.
+        let bash_default = json!({"toolName": "Bash"});
+        assert_eq!(
+            request_budget_ms("tools.execute", &bash_default),
+            Some(60_000 + 120_000 + 90_000)
+        );
+        // A tool with no effective timeout keeps the old unbounded behavior.
+        let read = json!({"toolName": "Read"});
+        assert_eq!(request_budget_ms("tools.execute", &read), None);
+    }
+
+    #[test]
+    fn request_budget_reads_the_camel_case_wire_shape_regression_1208() {
+        // Regression for the #1208 review: the runtime's real Bash payload —
+        // `toolName` / `timeoutMs` — must produce the tool-timeout budget,
+        // not an unbounded one. A 6h Bash must never be clipped to the fixed
+        // budget, and an unknown snake/camel mixture must still resolve.
+        let six_hours = json!({"toolName": "Bash", "timeoutMs": 21600000});
+        assert_eq!(
+            request_budget_ms("tools.execute", &six_hours),
+            Some(21_600_000 + 120_000 + 90_000)
+        );
+        // The snake_case fallback keeps hand-rolled callers honest.
+        let snake = json!({"tool_name": "Bash", "timeout_ms": 60000});
+        assert_eq!(
+            request_budget_ms("tools.execute", &snake),
+            Some(60_000 + 120_000 + 90_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_passes_fast_results_through() {
+        let result = with_request_budget(Some(1_000), async {
+            Ok::<_, JsonRpcError>(json!({"ok": true}))
+        })
+        .await
+        .expect("fast future must pass through untouched");
+        assert_eq!(result, json!({"ok": true}));
+    }
+
+    #[tokio::test]
+    async fn budget_ends_slow_request_with_host_rpc_timeout() {
+        let started = std::time::Instant::now();
+        let error = with_request_budget(Some(50), async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok::<_, JsonRpcError>(json!(null))
+        })
+        .await
+        .expect_err("a future past its budget must end with HOST_RPC_TIMEOUT");
+        assert_eq!(error.code, -32030);
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|d| d.get("errorCode"))
+                .and_then(|c| c.as_str()),
+            Some("HOST_RPC_TIMEOUT")
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout must fire at the budget, not the inner future's own duration"
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_cuts_loose_a_request_waiting_on_the_global_lock() {
+        let state = Arc::new(Mutex::new(()));
+        // Hold the global lock like a wedged handler would.
+        let holder = state.clone();
+        let guard = holder.lock().await;
+
+        // A queued request waiting for that lock: with the budget it fails
+        // on its own instead of piling up behind the wedged holder.
+        let waiter_state = state.clone();
+        let error = with_request_budget(Some(50), async move {
+            let _st = waiter_state.lock().await;
+            Ok::<_, JsonRpcError>(json!(null))
+        })
+        .await
+        .expect_err("a lock waiter past its budget must fail with HOST_RPC_TIMEOUT");
+        assert_eq!(error.code, -32030);
+
+        // The cancelled waiter held no guard: once the wedged holder lets go,
+        // the lock is immediately available again for everyone else.
+        drop(guard);
+        let lock_state = state.clone();
+        let acquired = tokio::time::timeout(Duration::from_millis(500), lock_state.lock()).await;
+        assert!(
+            acquired.is_ok(),
+            "lock must be acquirable right after the holder drops; a cancelled waiter must not be holding it"
+        );
+    }
+
+    // Deep-dive: issue #1071's failure mode is many requests queueing on one
+    // wedged handler. Every queued request must time out **independently** —
+    // one waiter's timeout must not extend or reset another's — and after the
+    // wedged holder lets go, a fresh request must go straight through.
+
+    #[tokio::test]
+    async fn budget_times_out_concurrent_lock_waiters_independently() {
+        let state = Arc::new(Mutex::new(()));
+        let holder = state.clone();
+        let guard = holder.lock().await;
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let waiter_state = state.clone();
+            handles.push(tokio::spawn(with_request_budget(Some(60), async move {
+                let _st = waiter_state.lock().await;
+                Ok::<_, JsonRpcError>(json!(null))
+            })));
+        }
+        for (index, handle) in handles.into_iter().enumerate() {
+            let result = handle.await.expect("budgeted task must not panic");
+            assert_eq!(
+                result.as_ref().err().map(|e| e.code),
+                Some(-32030),
+                "waiter #{index} must fail with HOST_RPC_TIMEOUT, got {:?}",
+                result
+            );
+        }
+        drop(guard);
+        let lock_state = state.clone();
+        let acquired = tokio::time::timeout(Duration::from_millis(500), lock_state.lock()).await;
+        assert!(acquired.is_ok(), "lock must be free after holder drops");
+    }
+
+    #[tokio::test]
+    async fn budget_recovery_lets_a_fresh_request_through_after_the_holder_releases() {
+        let state = Arc::new(Mutex::new(()));
+        let holder = state.clone();
+
+        // First: a wedged holder starves one budgeted request.
+        {
+            let _guard = holder.lock().await;
+            let waiter_state = state.clone();
+            let error = with_request_budget(Some(40), async move {
+                let _st = waiter_state.lock().await;
+                Ok::<_, JsonRpcError>(json!(null))
+            })
+            .await
+            .expect_err("starved while the holder wedges the lock");
+            assert_eq!(error.code, -32030);
+        }
+
+        // Then the holder releases: the very next request must succeed on the
+        // normal path — the budget must not have left any lingering damage.
+        let recovered = {
+            let request_state = state.clone();
+            with_request_budget(Some(1_000), async move {
+                let _st = request_state.lock().await;
+                Ok::<_, JsonRpcError>(json!({ "recovered": true }))
+            })
+            .await
+            .expect("a request after the holder releases must succeed")
+        };
+        assert_eq!(recovered, json!({ "recovered": true }));
+    }
+
+    #[test]
+    fn tools_execute_budget_covers_bash_max_and_unbounded_tools() {
+        // Bash may legally run up to 6h: the budget must never clip it to the
+        // fixed 135s, only pad the tool's own timeout with grace. Wire shape
+        // is camelCase (see the #1208 regression test).
+        let six_hours = json!({"toolName": "Bash", "timeoutMs": 21600000});
+        assert_eq!(
+            request_budget_ms("tools.execute", &six_hours),
+            Some(21_600_000 + 120_000 + 90_000)
+        );
+        // A tool without an effective timeout stays unbounded (None), exactly
+        // like before this change.
+        let unbounded = json!({"toolName": "Glob"});
+        assert_eq!(request_budget_ms("tools.execute", &unbounded), None);
+    }
 
     #[test]
     fn capability_errors_keep_their_protocol_code() {
@@ -6107,6 +5755,118 @@ mod tests {
         .unwrap();
         assert_eq!(updated["group"]["name"], "Adjusted");
         assert_eq!(updated["group"]["roots"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn grouped_folder_with_chats_can_be_detached_and_deleted_separately() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let primary = data_dir.path().join("primary");
+        let member = data_dir.path().join("member");
+        fs::create_dir_all(&primary).unwrap();
+        fs::create_dir_all(&member).unwrap();
+        let primary_input = primary.to_string_lossy().to_string();
+        let member_input = member.to_string_lossy().to_string();
+        let mut app_state = AppState::open(data_dir.path()).unwrap();
+        app_state.handshook = true;
+        let state = Arc::new(Mutex::new(app_state));
+
+        let group_response = handle_request(
+            state.clone(),
+            "project.group.create",
+            json!({ "name": "Grouped", "folders": [primary_input, member_input] }),
+            mpsc::unbounded_channel().0,
+        )
+        .await
+        .unwrap();
+        let group_id = group_response["group"]["id"].as_str().unwrap().to_string();
+        let primary_path = group_response["group"]["primaryPath"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let member_path = group_response["group"]["roots"][1]["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // This chat predates removing the member from the group.
+        let session_id = {
+            let st = state.lock().await;
+            sessions::create_session_with_options(
+                &st.db,
+                sessions::SessionCreateOptions {
+                    project_path: Some(member_path.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .id
+        };
+
+        let updated = handle_request(
+            state.clone(),
+            "project.group.update",
+            json!({ "groupId": group_id, "name": "Grouped", "folders": [primary_path] }),
+            mpsc::unbounded_channel().0,
+        )
+        .await
+        .expect("a member with chats can be detached from the group");
+        assert_eq!(updated["group"]["roots"].as_array().unwrap().len(), 1);
+
+        let detached_groups = handle_request(
+            state.clone(),
+            "project.groups.list",
+            json!({}),
+            mpsc::unbounded_channel().0,
+        )
+        .await
+        .unwrap();
+        assert!(detached_groups["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| {
+                group["legacy"] == json!(true) && group["roots"][0]["path"] == json!(member_path)
+            }));
+
+        let removed = handle_request(
+            state.clone(),
+            "projects.remove",
+            json!({ "path": member_path }),
+            mpsc::unbounded_channel().0,
+        )
+        .await
+        .expect("the detached project can then be deleted through the project action");
+        assert_eq!(removed["removed"], json!(true));
+        assert_eq!(removed["sessionsRemoved"], json!(1));
+        assert!(member.exists());
+
+        let groups_after_delete = handle_request(
+            state.clone(),
+            "project.groups.list",
+            json!({}),
+            mpsc::unbounded_channel().0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(groups_after_delete["groups"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            groups_after_delete["groups"][0]["roots"][0]["path"],
+            json!(primary_path)
+        );
+
+        let sessions_after_delete = handle_request(
+            state,
+            "session.list",
+            json!({}),
+            mpsc::unbounded_channel().0,
+        )
+        .await
+        .unwrap();
+        assert!(sessions_after_delete["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| session["id"] != json!(session_id)));
     }
 
     #[tokio::test]
@@ -6325,6 +6085,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn projects_remove_deletes_team_lead_before_same_project_member() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let project_dir = data_dir.path().join("team-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let mut app_state = AppState::open(data_dir.path()).unwrap();
+        app_state.handshook = true;
+        let project_path = project_dir.to_string_lossy().to_string();
+        let lead = sessions::create_session_with_options(
+            &app_state.db,
+            sessions::SessionCreateOptions {
+                title: Some("Lead".into()),
+                project_path: Some(project_path.clone()),
+                execution_profile: Some("team".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::team::ensure_team(&app_state.db, &lead.id).unwrap();
+        let member = sessions::create_session_with_options(
+            &app_state.db,
+            sessions::SessionCreateOptions {
+                title: Some("Member".into()),
+                project_path: Some(project_path.clone()),
+                execution_profile: Some("team".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app_state
+            .db
+            .conn()
+            .execute(
+                "INSERT INTO team_members (
+                team_session_id, member_session_id, name, context_kind, phase,
+                created_at, updated_at
+             ) VALUES (?1, ?2, 'worker', 'fresh', 'idle', 1, 1)",
+                rusqlite::params![lead.id, member.id],
+            )
+            .unwrap();
+        let state = Arc::new(Mutex::new(app_state));
+
+        let result = handle_request(
+            state.clone(),
+            "projects.remove",
+            json!({ "path": project_path }),
+            mpsc::unbounded_channel().0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["sessionsRemoved"], json!(2));
+        let state = state.lock().await;
+        assert!(sessions::get_session(&state.db, &lead.id)
+            .unwrap()
+            .is_none());
+        assert!(sessions::get_session(&state.db, &member.id)
+            .unwrap()
+            .is_none());
+        assert!(crate::team::get_team(&state.db, &lead.id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn projects_remove_refuses_team_member_when_lead_is_outside_project() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let removed_dir = data_dir.path().join("removed-project");
+        let kept_dir = data_dir.path().join("kept-project");
+        fs::create_dir_all(&removed_dir).unwrap();
+        fs::create_dir_all(&kept_dir).unwrap();
+        let mut app_state = AppState::open(data_dir.path()).unwrap();
+        app_state.handshook = true;
+        let lead = sessions::create_session_with_options(
+            &app_state.db,
+            sessions::SessionCreateOptions {
+                title: Some("Lead".into()),
+                project_path: Some(kept_dir.to_string_lossy().to_string()),
+                execution_profile: Some("team".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::team::ensure_team(&app_state.db, &lead.id).unwrap();
+        let member = sessions::create_session_with_options(
+            &app_state.db,
+            sessions::SessionCreateOptions {
+                title: Some("Member".into()),
+                project_path: Some(removed_dir.to_string_lossy().to_string()),
+                execution_profile: Some("team".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app_state
+            .db
+            .conn()
+            .execute(
+                "INSERT INTO team_members (
+                team_session_id, member_session_id, name, context_kind, phase,
+                created_at, updated_at
+             ) VALUES (?1, ?2, 'worker', 'fresh', 'idle', 1, 1)",
+                rusqlite::params![lead.id, member.id],
+            )
+            .unwrap();
+        let state = Arc::new(Mutex::new(app_state));
+
+        let error = handle_request(
+            state.clone(),
+            "projects.remove",
+            json!({ "path": removed_dir.to_string_lossy() }),
+            mpsc::unbounded_channel().0,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.data.as_ref().unwrap()["errorCode"],
+            "TEAM_MEMBER_DELETION_BLOCKED"
+        );
+        let state = state.lock().await;
+        assert!(sessions::get_session(&state.db, &lead.id)
+            .unwrap()
+            .is_some());
+        assert!(sessions::get_session(&state.db, &member.id)
+            .unwrap()
+            .is_some());
+        assert!(
+            crate::team::get_team_member_by_session_id(&state.db, &member.id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn projects_remove_keeps_sessions_of_other_projects() {
         let data_dir = tempfile::tempdir().unwrap();
         let removed_dir = data_dir.path().join("removed-project");
@@ -6445,7 +6337,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projects_remove_refuses_stored_group_root() {
+    async fn projects_remove_detaches_stored_group_root_and_promotes_next_root() {
         let data_dir = tempfile::tempdir().unwrap();
         let grouped_dir = data_dir.path().join("grouped");
         let extra_dir = data_dir.path().join("extra");
@@ -6454,47 +6346,57 @@ mod tests {
         let mut app_state = AppState::open(data_dir.path()).unwrap();
         app_state.handshook = true;
         let grouped_path = grouped_dir.to_string_lossy().to_string();
+        let extra_path = extra_dir.to_string_lossy().to_string();
         app_state
             .db
-            .create_project_group(
-                "Grouped",
-                &[
-                    grouped_path.clone(),
-                    extra_dir.to_string_lossy().to_string(),
-                ],
-            )
+            .create_project_group("Grouped", &[grouped_path.clone(), extra_path.clone()])
             .unwrap();
         let state = Arc::new(Mutex::new(app_state));
 
-        let error = handle_request(
+        let removed = handle_request(
             state.clone(),
             "projects.remove",
-            json!({ "path": grouped_path }),
+            json!({ "path": grouped_path.clone() }),
             mpsc::unbounded_channel().0,
         )
         .await
-        .expect_err("a stored project group root must not be removed");
-        assert_eq!(error.code, 1002);
-        assert_eq!(
-            error.data.as_ref().and_then(|data| data.get("errorCode")),
-            Some(&json!("INVALID_PARAMS"))
-        );
+        .expect("deleting a grouped project root also detaches it");
+        assert_eq!(removed["removed"], json!(true));
 
-        let canonical =
-            crate::db::canonical_project_path(&grouped_path).expect("canonical project path");
+        let canonical_grouped =
+            crate::db::canonical_project_path(&grouped_path).expect("deleted project path");
+        let canonical_extra =
+            crate::db::canonical_project_path(&extra_path).expect("remaining project path");
         let projects = handle_request(
-            state,
+            state.clone(),
             "projects.list",
             json!({}),
             mpsc::unbounded_channel().0,
         )
         .await
         .unwrap();
+        assert!(!projects["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|project| project["path"].as_str() == Some(canonical_grouped.as_str())));
         assert!(projects["projects"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|project| project["path"].as_str() == Some(canonical.as_str())));
+            .any(|project| project["path"].as_str() == Some(canonical_extra.as_str())));
+
+        let groups = handle_request(
+            state,
+            "project.groups.list",
+            json!({}),
+            mpsc::unbounded_channel().0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(groups["groups"].as_array().unwrap().len(), 1);
+        assert_eq!(groups["groups"][0]["primaryPath"], json!(canonical_extra));
+        assert_eq!(groups["groups"][0]["roots"].as_array().unwrap().len(), 1);
     }
 
     /// A single-folder stored project group is just a wrapper around one
@@ -6545,13 +6447,23 @@ mod tests {
     /// A running turn owns its session's tools, working directory, and
     /// transcript writes, so the bulk delete waits until the project is idle.
     #[tokio::test]
-    async fn projects_remove_refuses_while_a_session_is_running() {
+    async fn projects_remove_refuses_while_a_session_is_running_without_detaching_group() {
         let data_dir = tempfile::tempdir().unwrap();
         let project_dir = data_dir.path().join("busy-project");
+        let remaining_dir = data_dir.path().join("remaining-project");
         fs::create_dir_all(&project_dir).unwrap();
+        fs::create_dir_all(&remaining_dir).unwrap();
         let mut app_state = AppState::open(data_dir.path()).unwrap();
         app_state.handshook = true;
         let project_path = project_dir.to_string_lossy().to_string();
+        let remaining_path = remaining_dir.to_string_lossy().to_string();
+        app_state
+            .db
+            .create_project_group(
+                "Busy group",
+                &[project_path.clone(), remaining_path.clone()],
+            )
+            .unwrap();
         let session_id = sessions::create_session_with_options(
             &app_state.db,
             sessions::SessionCreateOptions {
@@ -6602,6 +6514,25 @@ mod tests {
             .unwrap()
             .iter()
             .any(|project| project["path"].as_str() == Some(canonical.as_str())));
+        let groups_while_busy = handle_request(
+            state.clone(),
+            "project.groups.list",
+            json!({}),
+            mpsc::unbounded_channel().0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            groups_while_busy["groups"][0]["roots"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            groups_while_busy["groups"][0]["primaryPath"],
+            json!(canonical)
+        );
         let listed = handle_request(
             state.clone(),
             "session.list",
@@ -6625,7 +6556,7 @@ mod tests {
         .await
         .unwrap();
         let removed = handle_request(
-            state,
+            state.clone(),
             "projects.remove",
             json!({ "path": project_path }),
             mpsc::unbounded_channel().0,
@@ -6634,6 +6565,28 @@ mod tests {
         .unwrap();
         assert_eq!(removed["removed"], json!(true));
         assert_eq!(removed["sessionsRemoved"], json!(1));
+        let groups_after_delete = handle_request(
+            state,
+            "project.groups.list",
+            json!({}),
+            mpsc::unbounded_channel().0,
+        )
+        .await
+        .unwrap();
+        let remaining_canonical =
+            crate::db::canonical_project_path(&remaining_path).expect("remaining project path");
+        assert_eq!(groups_after_delete["groups"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            groups_after_delete["groups"][0]["roots"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            groups_after_delete["groups"][0]["primaryPath"],
+            json!(remaining_canonical)
+        );
     }
 
     #[tokio::test]
@@ -7507,6 +7460,7 @@ mod tests {
             None,
         )
         .unwrap();
+        crate::team::ensure_team(&state.db, &goal.id).unwrap();
         let turn = sessions::begin_turn(&state.db, &goal.id, None, None).unwrap();
         let workspace = resolve_plan_workspace(&state, &goal.id, plans::KIND_GOAL).unwrap();
         let proposal = state
@@ -7534,8 +7488,12 @@ mod tests {
                 .unwrap_err();
         assert_eq!(move_err.to_string(), "PLAN_CONFIGURATION_BLOCKED");
 
-        let delete_err = sessions::delete_session(&state.db, &goal.id).unwrap_err();
+        let delete_err =
+            sessions::delete_session_with_team_cleanup(&state.db, &goal.id).unwrap_err();
         assert_eq!(delete_err.to_string(), "PLAN_CONFIGURATION_BLOCKED");
+        assert!(crate::team::get_team(&state.db, &goal.id)
+            .unwrap()
+            .is_some());
 
         // Reject the proposal
         state
@@ -7565,7 +7523,10 @@ mod tests {
         ));
 
         // Delete succeeds
-        assert!(sessions::delete_session(&state.db, &goal.id).unwrap());
+        assert!(sessions::delete_session_with_team_cleanup(&state.db, &goal.id).unwrap());
+        assert!(crate::team::get_team(&state.db, &goal.id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -8002,6 +7963,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_set_round_trips_live_voice_without_changing_dictation_settings() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app_state = AppState::open(data_dir.path()).unwrap();
+        app_state.handshook = true;
+        let state = Arc::new(Mutex::new(app_state));
+        let tx = mpsc::unbounded_channel().0;
+        let live_voice = json!({
+            "enabled": false,
+            "selectedBindingId": "codex-main",
+            "bindings": [{
+                "id": "codex-main",
+                "adapterId": "codex-live",
+                "providerId": "codex-account-a",
+                "voice": "cove"
+            }]
+        });
+        let dictation = json!({
+            "enabled": true,
+            "deviceId": "microphone-1",
+            "languages": ["en"],
+            "chineseVariant": "simplified",
+            "modelId": "local-model"
+        });
+
+        handle_request(
+            state.clone(),
+            "settings.set",
+            json!({ "liveVoice": live_voice, "voice": dictation }),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        handle_request(
+            state.clone(),
+            "settings.set",
+            json!({ "theme": "light" }),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        let stored = handle_request(state, "settings.get", json!({}), tx)
+            .await
+            .unwrap();
+
+        assert_eq!(stored["liveVoice"], live_voice);
+        assert_eq!(stored["voice"], dictation);
+        assert_eq!(stored["theme"], "light");
+    }
+
+    #[tokio::test]
     async fn settings_set_preserves_stored_shell_when_shell_is_omitted() {
         let Some(current_shell) = available_test_shell_id() else {
             return;
@@ -8037,6 +8048,154 @@ mod tests {
             .unwrap();
         assert_eq!(settings["defaultCommandShell"], stored_shell);
         assert_eq!(settings["theme"], "light");
+    }
+
+    /// Creates a provider row through the RPC surface the shell uses.
+    async fn create_test_provider(
+        state: Arc<Mutex<AppState>>,
+        tx: mpsc::UnboundedSender<String>,
+    ) -> String {
+        let created = handle_request(
+            state,
+            "providers.create",
+            json!({
+                "name": "Image service",
+                "baseUrl": "http://localhost:8080/v1",
+                "authKind": "none",
+                "defaultModelId": "gpt-image-2.5"
+            }),
+            tx,
+        )
+        .await
+        .unwrap();
+        created["provider"]["id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn settings_set_drops_image_bindings_whose_provider_is_gone() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app_state = AppState::open(data_dir.path()).unwrap();
+        app_state.handshook = true;
+        let state = Arc::new(Mutex::new(app_state));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let provider_id = create_test_provider(state.clone(), tx.clone()).await;
+
+        // The shell writes whole snapshots back, so a binding for a row that no
+        // longer exists can arrive through an ordinary settings write.
+        handle_request(
+            state.clone(),
+            "settings.set",
+            json!({
+                "imageGeneration": { "providerId": provider_id, "modelId": "gpt-image-2.5" },
+                "imageGenerationModels": [
+                    { "providerId": provider_id, "modelId": "gpt-image-2.5" },
+                    { "providerId": "removed-service", "modelId": "gpt-image-2.5" }
+                ]
+            }),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let settings = handle_request(state.clone(), "settings.get", json!({}), tx.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            settings["imageGeneration"],
+            json!({ "providerId": provider_id, "modelId": "gpt-image-2.5" })
+        );
+        assert_eq!(
+            settings["imageGenerationModels"],
+            json!([{ "providerId": provider_id, "modelId": "gpt-image-2.5" }])
+        );
+
+        let stored = state.lock().await.db.get_setting("app").unwrap().unwrap();
+        assert_eq!(stored["imageGenerationModels"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn settings_get_repairs_a_binding_left_by_a_deleted_provider() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app_state = AppState::open(data_dir.path()).unwrap();
+        app_state.handshook = true;
+        let state = Arc::new(Mutex::new(app_state));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let provider_id = create_test_provider(state.clone(), tx.clone()).await;
+
+        handle_request(
+            state.clone(),
+            "settings.set",
+            json!({
+                "imageGeneration": { "providerId": provider_id, "modelId": "gpt-image-2.5" },
+                "imageGenerationModels": [
+                    { "providerId": provider_id, "modelId": "gpt-image-2.5" }
+                ]
+            }),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        let deleted = handle_request(
+            state.clone(),
+            "providers.delete",
+            json!({ "id": provider_id }),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleted["ok"], true);
+
+        // Reading the settings repairs what the deletion left behind, so a
+        // binding the runtime would reject never reaches the shell again.
+        let settings = handle_request(state.clone(), "settings.get", json!({}), tx.clone())
+            .await
+            .unwrap();
+        assert!(settings["imageGeneration"].is_null());
+        assert_eq!(settings["imageGenerationModels"], json!([]));
+
+        let stored = state.lock().await.db.get_setting("app").unwrap().unwrap();
+        assert!(stored["imageGeneration"].is_null());
+        assert_eq!(stored["imageGenerationModels"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn settings_keep_image_bindings_for_a_disabled_provider() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app_state = AppState::open(data_dir.path()).unwrap();
+        app_state.handshook = true;
+        let state = Arc::new(Mutex::new(app_state));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let provider_id = create_test_provider(state.clone(), tx.clone()).await;
+        let disabled = handle_request(
+            state.clone(),
+            "providers.update",
+            json!({ "id": provider_id, "enabled": false }),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(disabled["provider"]["enabled"], false);
+
+        // A row that still exists keeps its binding: an unavailable but
+        // present provider is a state the user repairs in Settings, and
+        // pruning it would silently discard the user's choice.
+        handle_request(
+            state.clone(),
+            "settings.set",
+            json!({
+                "imageGeneration": { "providerId": provider_id, "modelId": "gpt-image-2.5" }
+            }),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        let settings = handle_request(state, "settings.get", json!({}), tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            settings["imageGeneration"],
+            json!({ "providerId": provider_id, "modelId": "gpt-image-2.5" })
+        );
     }
 
     #[tokio::test]
@@ -8635,6 +8794,7 @@ mod tests {
             .unwrap();
         let permission: Value = serde_json::from_str(&permission).unwrap();
         assert_eq!(permission["method"], "permissions.request");
+        assert!(permission["params"].get("timeoutMs").is_none());
         let request_id = permission["params"]["requestId"]
             .as_str()
             .unwrap()
@@ -8653,11 +8813,9 @@ mod tests {
         assert_eq!(requests[0]["requestId"], request_id);
         assert_eq!(requests[0]["sessionId"], session.id);
         assert_eq!(requests[0]["toolName"], "Bash");
-        assert_eq!(requests[0]["timeoutMs"], 120000);
-        assert!(
-            requests[0]["expiresAt"].as_str().unwrap() > requests[0]["createdAt"].as_str().unwrap()
-        );
-        assert!(requests[0]["remainingMs"].as_u64().unwrap() <= 120000);
+        assert!(requests[0].get("timeoutMs").is_none());
+        assert!(requests[0].get("expiresAt").is_none());
+        assert!(requests[0].get("remainingMs").is_none());
 
         let other = handle_request(
             state.clone(),
@@ -10559,41 +10717,264 @@ mod image_generation_settings_tests {
     }
 
     #[tokio::test]
-    async fn team_rpc_full_journey() {
+    async fn team_member_direct_turn_and_new_mail_require_approval() {
         let data_dir = tempfile::tempdir().unwrap();
         let mut app_state = AppState::open(data_dir.path()).unwrap();
         app_state.handshook = true;
         let state = Arc::new(Mutex::new(app_state));
         let (tx, _rx) = mpsc::unbounded_channel();
+        let lead = handle_request(
+            state.clone(),
+            "session.create",
+            json!({"executionProfile": "team"}),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        let member = handle_request(
+            state.clone(),
+            "session.create",
+            json!({"executionProfile": "team"}),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        let lead_id = lead["session"]["id"].as_str().unwrap();
+        let member_id = member["session"]["id"].as_str().unwrap();
+        {
+            let st = state.lock().await;
+            // Model an upgraded pre-approval roster without inventing approval.
+            st.db.conn().execute("INSERT OR IGNORE INTO teams (team_session_id, revision, paused, created_at, updated_at) VALUES (?1,1,0,1,1)", rusqlite::params![lead_id]).unwrap();
+            st.db.conn().execute("INSERT INTO team_members (team_session_id, member_session_id, name, context_kind, phase, created_at, updated_at) VALUES (?1,?2,'legacy','fresh','idle',1,1)", rusqlite::params![lead_id,member_id]).unwrap();
+        }
+        let denied = handle_request(
+            state.clone(),
+            "session.beginTurn",
+            json!({"sessionId": member_id}),
+            tx.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.data.unwrap()["errorCode"], "TEAM_APPROVAL_REQUIRED");
+        let denied_mail = handle_request(
+            state.clone(),
+            "team.sendMessage",
+            json!({
+                "teamSessionId": lead_id, "callerSessionId": member_id,
+                "target": "Lead", "content": "Unapproved new work"
+            }),
+            tx.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            denied_mail.data.unwrap()["errorCode"],
+            "TEAM_APPROVAL_REQUIRED"
+        );
+        let st = state.lock().await;
+        let turns: i64 = st
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM turns WHERE session_id=?1",
+                rusqlite::params![member_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mail: i64 = st
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM session_collaboration_messages WHERE source_session_id=?1",
+                rusqlite::params![member_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((turns, mail), (0, 0));
+    }
 
+    #[tokio::test]
+    async fn team_rpc_full_journey() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app_state = AppState::open(data_dir.path()).unwrap();
+        app_state.handshook = true;
+        let state = Arc::new(Mutex::new(app_state));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let configured_provider = handle_request(
+            state.clone(), "providers.create",
+            json!({ "name": "Review fixture", "vendorKey": "custom",
+                "apiStyle": "chat_completions", "authKind": "none", "baseUrl": "http://127.0.0.1:9/v1",
+                "defaultModelId": "review-fixture", "models": [{ "id": "review-fixture",
+                    "contextWindow": 128000, "maxTokens": 2048 }] }), tx.clone(),
+        ).await.unwrap();
+        let provider_id = configured_provider["provider"]["id"].as_str().unwrap();
         // 1. Create team session
         let created = handle_request(
             state.clone(),
             "session.create",
-            json!({ "mode": "agent", "executionProfile": "team" }),
+            json!({ "mode": "agent", "executionProfile": "team", "providerId": provider_id, "modelId": "review-fixture" }),
             tx.clone(),
         )
         .await
         .unwrap();
         let team_id = created["session"]["id"].as_str().unwrap();
 
-        // 2. Spawn teammate via RPC
-        let spawned = handle_request(
+        // 2. Legacy mutation is rejected before approval, with no roster effects.
+        let spawn_request = json!({ "teamSessionId": team_id, "callerSessionId": team_id,
+            "name": "explorer", "description": "Finds files", "contextKind": "fresh" });
+        let rejected = handle_request(
             state.clone(),
             "team.createMember",
-            json!({
-                "teamSessionId": team_id,
-                "callerSessionId": team_id,
-                "name": "explorer",
-                "description": "Finds files",
-                "contextKind": "fresh"
-            }),
+            spawn_request.clone(),
+            tx.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            rejected.data.unwrap()["errorCode"],
+            "TEAM_APPROVAL_REQUIRED"
+        );
+        let turn = handle_request(
+            state.clone(),
+            "session.beginTurn",
+            json!({"sessionId": team_id}),
             tx.clone(),
         )
         .await
         .unwrap();
-        assert_eq!(spawned["member"]["name"], "explorer");
-        let member_session_id = spawned["member"]["memberSessionId"].as_str().unwrap();
+        let turn_id = turn["turnId"].as_str().unwrap();
+        let declaration = handle_request(state.clone(), "team.declareStrategy", json!({
+            "teamSessionId": team_id, "callerSessionId": team_id, "leadTurnId": turn_id,
+            "strategy": "delegate", "reason": "A specialist can inspect the repository.",
+            "members": [{"name": "explorer", "description": "Finds files", "contextKind": "fresh"}]
+        }), tx.clone()).await.unwrap();
+        let review_id = declaration["review"]["reviewId"].as_str().unwrap();
+        let revision = declaration["review"]["revision"].as_i64().unwrap();
+        assert_eq!(declaration["decision"]["leadTurnId"], turn_id);
+        let pending_roster = handle_request(
+            state.clone(),
+            "team.getRoster",
+            json!({"teamSessionId": team_id, "callerSessionId": team_id}),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(pending_roster["members"].as_array().unwrap().is_empty());
+        let pending_snapshot = handle_request(
+            state.clone(),
+            "team.getSnapshot",
+            json!({"teamSessionId": team_id, "callerSessionId": team_id}),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pending_snapshot["teamSessionId"], team_id);
+        assert_eq!(pending_snapshot["review"]["status"], "pending");
+        assert_eq!(pending_snapshot["members"].as_array().unwrap().len(), 0);
+        let mut matching_change = None;
+        while let Ok(raw) = rx.try_recv() {
+            let note: Value = serde_json::from_str(&raw).unwrap();
+            if note["method"] == "team.changed"
+                && note["params"]["teamSessionId"] == team_id
+                && note["params"]["revision"] == pending_snapshot["revision"]
+                && note["params"]["reason"] == "member"
+            {
+                matching_change = Some(note);
+            }
+        }
+        assert!(
+            matching_change.is_some(),
+            "pending review change is published"
+        );
+        let malformed = handle_request(
+            state.clone(),
+            "team.declareStrategy",
+            json!({
+                "teamSessionId": team_id, "callerSessionId": team_id, "leadTurnId": turn_id,
+                "strategy": "delegate", "members": [{"name": 123}]
+            }),
+            tx.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(malformed.data.unwrap()["errorCode"], "INVALID_PARAMS");
+        for selections in [
+            json!({"name": "explorer"}),
+            json!([{"name": "explorer", "providerId": 7}]),
+        ] {
+            let malformed_update = handle_request(
+                state.clone(),
+                "team.updateLaunchReview",
+                json!({
+                    "teamSessionId": team_id, "reviewId": review_id, "expectedRevision": revision,
+                    "selections": selections
+                }),
+                tx.clone(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                malformed_update.data.unwrap()["errorCode"],
+                "INVALID_PARAMS"
+            );
+        }
+        let unchanged = handle_request(
+            state.clone(),
+            "team.getLaunchReview",
+            json!({"teamSessionId": team_id, "reviewId": review_id}),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unchanged["review"]["revision"], revision);
+        handle_request(
+            state.clone(),
+            "session.endTurn",
+            json!({"turnId": turn_id, "status": "completed"}),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        let confirm_request =
+            json!({"teamSessionId": team_id, "reviewId": review_id, "expectedRevision": revision});
+        let approved = handle_request(
+            state.clone(),
+            "team.confirmLaunchReview",
+            confirm_request.clone(),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        let duplicate = handle_request(
+            state.clone(),
+            "team.confirmLaunchReview",
+            confirm_request,
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            approved["decision"]["memberSessionIds"],
+            duplicate["decision"]["memberSessionIds"]
+        );
+        assert_eq!(
+            approved["decision"]["messageIds"],
+            duplicate["decision"]["messageIds"]
+        );
+        let member_session_id = approved["decision"]["memberSessionIds"][0]
+            .as_str()
+            .unwrap();
+        let configured_member = handle_request(
+            state.clone(),
+            "session.get",
+            json!({"id": member_session_id}),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(configured_member["session"]["providerId"], provider_id);
+        assert_eq!(configured_member["session"]["modelId"], "review-fixture");
 
         // 3. Get roster
         let roster = handle_request(
@@ -10723,5 +11104,36 @@ mod image_generation_settings_tests {
         .await
         .unwrap();
         assert_eq!(get_member["session"]["executionProfile"], "standard");
+    }
+}
+
+#[cfg(test)]
+mod update_settings_tests {
+    use super::*;
+
+    #[test]
+    fn validates_update_preference_and_reminder_version() {
+        for value in [
+            json!({}),
+            json!({"updatePreference": "automatic"}),
+            json!({"updatePreference": "manual"}),
+            json!({"lastNotifiedUpdateVersion": "0.15.9"}),
+            json!({"updateDismissedVersion": "0.15.9"}),
+            json!({"updateDismissedVersion": null}),
+        ] {
+            assert!(validate_settings_value(&value).is_ok(), "{value}");
+        }
+        for value in [
+            json!({"updatePreference": "sometimes"}),
+            json!({"updatePreference": null}),
+            json!({"lastNotifiedUpdateVersion": "  "}),
+            json!({"lastNotifiedUpdateVersion": 12}),
+            json!({"lastNotifiedUpdateVersion": "x".repeat(129)}),
+            json!({"updateDismissedVersion": "  "}),
+            json!({"updateDismissedVersion": 12}),
+            json!({"updateDismissedVersion": "x".repeat(129)}),
+        ] {
+            assert!(validate_settings_value(&value).is_err(), "{value}");
+        }
     }
 }

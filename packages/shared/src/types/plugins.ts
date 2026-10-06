@@ -9,8 +9,12 @@ import type { TrustedExtensionDiagnostic } from "../trusted-extensions.js";
  * plugin center, so a settings row written before the center existed keeps
  * meaning what its author picked instead of needing a migration. `github` and
  * `mirror` are the two backup channels, and `custom` is a URL the user typed.
+ * `plus` is the curated channel: a maintainer review admits an exact
+ * `(pluginId, version, shasum)` before it can appear in that channel's
+ * catalog. The label describes that review — never who published the plugin,
+ * and never a guarantee that its code is safe.
  */
-export type PluginMarketSource = "official" | "github" | "mirror" | "custom";
+export type PluginMarketSource = "official" | "github" | "mirror" | "custom" | "plus";
 
 export type PluginUpdateInfo = {
   version: string;
@@ -50,6 +54,13 @@ export type MarketProvenance = {
 };
 
 /** Publish verdict issued by the center's policy evaluator. */
+export type ExpectedMarketplace = {
+  source: string;
+  catalogUrl: string;
+  version: string;
+  shasum: string;
+};
+
 export type MarketReview = {
   decision?: string;
   risk?: string;
@@ -71,6 +82,12 @@ export type PluginMarketplaceMeta = {
   trust?: MarketTrust;
   /** Source pin of the installed version, when the catalog carried one. */
   provenance?: MarketProvenance;
+  /**
+   * Maintainer review that admitted this exact version, when the channel
+   * carries one. Absent on records written before a curated channel existed;
+   * its absence means "no review assertion", not "reviewed".
+   */
+  review?: MarketReview;
 };
 
 export type PluginUiMeta = {
@@ -199,7 +216,36 @@ export type PluginCapability =
   | "services"
   | "bus"
   /** `contributes.agentExtensions`: ExtensionAPI modules in the agent process. */
-  | "agentExtension";
+  | "agentExtension"
+  /** `manifest.renderer`: the plugin ships a renderer slot entry (`docs/plugin-plan/ui/`). */
+  | "rendererUi";
+
+/**
+ * A loaded plugin's renderer extension as the renderer host sees it
+ * (`docs/plugin-plan/ui/`). The main process builds it from the live load, so
+ * it never outlives the plugin: unload, crash, or a revoked permission drops
+ * it from the next plugin list.
+ */
+export type PluginRendererDescriptor = {
+  /** Renderer module path relative to the plugin root. */
+  entry: string;
+  /**
+   * Load generation. Every load of the plugin gets a new one, and module URLs
+   * carry it (`plugin-renderer://<id>/g<generation>/<entry>`), so a reload
+   * evaluates fresh modules instead of the ES module cache's stale copy and a
+   * stale generation is refused outright.
+   */
+  generation: number;
+  /** `manifest.rendererActions`: the outbound actions dispatch accepts. */
+  actions: string[];
+  /** `manifest.rendererCallMethods`: the `plugin.call` method whitelist. */
+  callMethods: string[];
+  /**
+   * Bare `contributes.agentTools[].name`s. A `toolCard` registration must
+   * name one of these; the card then serves only that tool's calls.
+   */
+  tools: string[];
+};
 
 export type PluginSettingType =
   | "string"
@@ -248,6 +294,8 @@ export type PluginTheme = {
    * and holds `ui.window.appearance` (ADR 0248).
    */
   windowBackground?: { light?: string; dark?: string };
+  /** Validated `contributes.windowAppearance.cornerRadius`, in DIP. */
+  windowCornerRadius?: number;
 };
 
 export type PluginServiceState = "starting" | "running" | "stopped" | "failed";
@@ -285,6 +333,12 @@ export type PluginSummary = {
   path?: string;
   /** Derived from the manifest by the host: which contribution kinds exist. */
   capabilities?: PluginCapability[];
+  /**
+   * Present only while the plugin is loaded, holds `renderer.extension`, and
+   * declares `manifest.renderer`: everything the renderer host needs to load
+   * the plugin's slot module and gate what it registers and dispatches.
+   */
+  renderer?: PluginRendererDescriptor;
   description?: string;
   author?: string;
   installedAt?: string;

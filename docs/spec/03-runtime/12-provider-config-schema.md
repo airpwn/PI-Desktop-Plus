@@ -92,6 +92,7 @@ Tables (canonical DDL in [04-data-storage](04-data-storage.md) §4.3–4.4, §4.
           "contextWindow": { "type": "integer", "minimum": 0 },
           "contextWindowSource": { "enum": ["catalog", "user"] },
           "maxTokens": { "type": "integer", "minimum": 0 },
+          "maxTokensSource": { "enum": ["catalog", "user"] },
           "thinkingLevels": {
             "type": "array",
             "items": { "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"] },
@@ -101,7 +102,10 @@ Tables (canonical DDL in [04-data-storage](04-data-storage.md) §4.3–4.4, §4.
             "type": ["string", "null"],
             "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max", "omit", null]
           },
-          "thinkingProtocol": { "enum": ["legacy", "adaptive"] },
+          "thinkingProtocol": {
+            "enum": ["legacy", "adaptive"],
+            "description": "Provider request protocol used when thinking is enabled; absent preserves legacy behavior."
+          },
           "supportsImages": { "type": ["boolean", "null"] },
           "supportsDocuments": { "type": ["boolean", "null"] },
           "availableForSubagents": { "type": "boolean", "default": false }
@@ -121,13 +125,19 @@ provider or model resolution; UI naming and clearing rules are specified in
 alias, drops a blank one, and enforces the 60-character limit by rejecting an
 over-long alias with `MODEL_ALIAS_TOO_LONG`.
 
-`models[].contextWindowSource` records where the stored `contextWindow` came
-from. `catalog` marks a models.dev snapshot that a later catalog correction may
-replace; `user` marks a number entered in Settings and is never replaced. The
-property is optional, so a config written before the marker stays readable and
-older clients ignore it. Host-core keeps only those two values and drops anything
-else, so an unreadable marker cannot turn into a third state. The resolution rule
-is specified in [13-model-catalog-and-selection](13-model-catalog-and-selection.md) §9.1.
+`models[].contextWindowSource` and `models[].maxTokensSource` independently
+record where their corresponding limit came from. `catalog` marks a models.dev
+snapshot that a later correction may replace (a lookup that falls back to the
+generic shape is not a correction); `user` marks a value entered in Settings
+and is never replaced. In particular, changing the context window does not
+change ownership of the output cap. Both properties are optional, so configs
+written before either marker stay readable and older clients ignore them.
+Host-core keeps only `catalog` and `user` and drops other values. Legacy rows
+without a source marker preserve their stored limit, including the generic
+128,000 / 8,192 values, because the old record cannot reveal whether a value was
+an explicit user choice.
+The resolution rule is specified in
+[13-model-catalog-and-selection](13-model-catalog-and-selection.md) §9.1.
 
 `compatibility.supportsReasoning` and
 `compatibility.supportedThinkingLevels` remain readable for stored-record and
@@ -209,6 +219,11 @@ legacy binding above is materialized with, and the same value a plugin
 manifest that declares no limits already produces. The stored array and the
 manifest therefore agree on what a model without limits means (D610).
 
+For `supportsImages` and `supportsDocuments`, absent or `null` follows the
+published capability until the user explicitly changes the checkbox. Either
+explicit boolean is then pinned, even when it equals today's published value;
+a later catalog correction cannot reverse the user's choice.
+
 Each entry of a stored `models` array is decoded on its own. An entry that no
 longer matches the schema is skipped and reported on the host log with the
 provider id, its index and the reason, instead of discarding the whole array.
@@ -257,7 +272,9 @@ Anthropic OAuth's `claude-cli/<version>`, or OpenCode's
 outbound HTTP — session turns, subagents, prompt enhancement, plugin one-shots,
 `/models` discovery (including unsaved form values), connection tests, and
 OAuth token refresh. A fetch wrapper is the last writer so Codex and the
-Anthropic SDK cannot overwrite it. The same values are also placed on stream-
+Anthropic SDK cannot overwrite it; pi-ai's Google adapters receive the same
+values on stream-option headers instead, because they reject any other `fetch`
+(issue #1072). The same values are also placed on stream-
 option headers so OpenCode's caller-wins rule stays true. Keys are
 case-insensitive unique, at most 32 entries, name ≤ 256 bytes, value ≤ 4096
 bytes, no CR/LF, names alphanumeric plus hyphen. Values are folded to
@@ -381,19 +398,49 @@ Presets only prefill form defaults; they are not a closed world.
 
 These rows are created from the add-provider **Service** select, not from a
 new protocol. They remain `type: "openai_compatible"`. The common path is
-Service + API key; the published host is a summary, and the display name is
+Service + API key; the summary shows the endpoint host and path so subscription
+routes remain visible (wrapping when needed), and the display name is
 editable in Advanced. Custom endpoint shows Name beside Base URL, then API key
 beside API format. `vendorKey` is the models.dev provider key.
 
 International: OpenAI (`responses`), Anthropic (`anthropic_messages`), Google
 Gemini (`google_generative_ai`), OpenRouter, Groq, xAI, Mistral, Together AI,
-Fireworks, OpenCode Go (`opencode_go`), Z.AI / Z.AI Coding Plan.
+Fireworks, OpenCode Go (`opencode_go`), Z.AI / Z.AI Coding Plan, Ant Ling,
+Baseten, Cerebras, Hugging Face (`huggingface`, aliases `hugging-face` / `hf`),
+Meta (`responses`), MiniMax (International) (`anthropic_messages` at
+`https://api.minimax.io/anthropic/v1`), Moonshot AI (International)
+(`moonshotai` at `https://api.moonshot.ai/v1`), NVIDIA (alias `nim`), OpenCode
+Zen (`opencode` at `https://opencode.ai/zen/v1`, alias `opencode-zen`), Vercel
+AI Gateway (`vercel` at `https://ai-gateway.vercel.sh/v1`, alias
+`vercel-ai-gateway`).
+
+`builtinProviders()` from pi-ai is the source for this list: every built-in
+provider is either reachable through one of the presets above or is an
+intentional exception with a recorded reason — Amazon Bedrock, Azure OpenAI,
+Cloudflare AI Gateway, Cloudflare Workers AI, and Google Vertex AI (their URLs
+carry account, region, project, or deployment ids), GitHub Copilot and OpenAI
+Codex (vendor-account rows), and Radius (`pi_messages` is account-only in this
+app). `packages/agent-runtime/src/pi-ai-provider-sync.test.ts` fails when a new
+built-in provider is neither covered nor excepted.
 
 China: DeepSeek, Qwen DashScope (`alibaba-cn`), Moonshot (`moonshotai-cn`),
 Zhipu AI / Coding Plan, SiliconFlow (`siliconflow-cn`), Volcengine Ark,
 MiniMax (`anthropic_messages` at `https://api.minimaxi.com/anthropic/v1`),
 MiniMax (OpenAI) (`chat_completions` at `https://api.minimaxi.com/v1`, aliases
-`minimax-openai` / `minimax-compatible`), Kimi For Coding (`anthropic_messages`).
+`minimax-openai` / `minimax-compatible`), Kimi For Coding (`anthropic_messages`),
+Qwen Token Plan (`alibaba-token-plan`, aliases `qwen-token-plan` /
+`qwen-token-plan-individual`), Qwen Token Plan (China)
+(`alibaba-token-plan-cn`, alias `qwen-token-plan-cn`), Xiaomi Token Plan
+(`xiaomi-token-plan-cn` / `-ams` / `-sgp`).
+
+StepFun Plan uses the `stepfun-plan` preset with catalog vendor key
+`stepfun-step-plan`, Base URL `https://api.stepfun.com/step_plan/v1`, and
+`anthropic_messages`. The existing Anthropic adapter removes the trailing
+`/v1` before the SDK appends `/v1/messages`, preserving the subscription path.
+Step 5 Preview capabilities come from the bundled first-party models.dev
+record; no supplemental catalog or hard-coded limits are needed. The ordinary
+StepFun API and existing custom-provider rows retain their configuration.
+
 
 Zhipu / Z.AI Completions requests still receive `thinkingFormat: "zai"` and
 `zaiToolStream: true`. pi-ai `zai-coding-cn` remains an alias of
@@ -559,15 +606,20 @@ The canonical DDL lives in [04-data-storage](04-data-storage.md) (D086). Summary
   not have
 
 ### `providers.listModels`
-- renderer IPC in: `{ providerId, source?: "cache"|"refresh" }`; `cache`
+- renderer IPC in: `{ providerId, baseUrl?, apiKey?, apiStyle?, headers?,
+  source?: "cache"|"refresh", intent?: "manual-fetch-list" }`; `cache`
   returns the durable catalog without provider network access, while `refresh`
-  reads the local models.dev snapshot and runs provider endpoint discovery only for IDs absent from it
+  probes the provider for selectable IDs and decorates the answer with the
+  local models.dev snapshot; the catalog list is used only when discovery has
+  no usable answer. `intent` marks the one explicit manual action and is
+  transient; see §12.
 - host RPC in: `{ providerId?: string }`; reads only the Rust-owned `models`
   table
 - for an `authKind: "oauth"` row Electron main reads the signed-in account's
-  model list (see `03-runtime/11-provider-model-system.md`) instead of the
-  pinned catalog. pi-ai `models.getAvailable` is used only when that request
-  fails. Each returned model carries the apiStyle its wire API implies.
+  model IDs (see `03-runtime/11-provider-model-system.md`) instead of the
+  published catalog. pi-ai `models.getAvailable` may provide fallback IDs only
+  when that request fails; it never supplies chat-model limits or capabilities.
+  Each returned model carries the apiStyle its wire API implies.
   `openai-codex` calls `GET {base}/codex/models`, so an account id such as
   `gpt-6-luna` appears without a pin update; models.dev does not invent those
   IDs. Copilot still hides models the account did not enable.
@@ -667,12 +719,166 @@ new IPC field is introduced. Unknown connection formats stay unavailable in
 this app; that is not a claim about a vendor website or other API. Some official
 search APIs require distinct adapters; see the native search provider audit.
 
-For custom endpoints, an explicit `/chat/completions`, `/responses`, or
-`/messages` URL can suggest the matching format. Applying that suggestion only
-changes the draft format and strips the operation suffix, preserving the
-origin. It is not a successful connection/capability probe. A plain base URL
-does not prove the protocol. Invalid/credential-bearing URLs give no advice.
-OpenCode Go normalizes `/chat/completions`, not `/responses`. Saved explicit
-formats take precedence over hostname presets; service names survive edits.
-Cancel does not persist draft changes. Full probing and automatic error-driven
-fallback from #907 remain separate work.
+#### Endpoint resolution
+
+A typed Base URL is resolved before anything is probed. Resolution is one pure
+shared layer (`@pi-desktop/shared/provider-endpoint`) that the settings dialog
+and Electron main both call, so the address shown, the address probed and the
+address saved cannot disagree:
+
+- A bare host is completed with `https://` inside the origin the user named.
+  Credentials, queries and fragments are still refused.
+- A pasted operation suffix (`/chat/completions`, `/responses`, `/messages`)
+  names the format and is stripped from the base endpoint; `/models` only marks
+  a discovery URL. A suffix belonging to another format is kept in place — the
+  mismatch is the user's to resolve, not a silent retarget of the row.
+- The format comes, in order, from the user's own choice, the pasted operation,
+  an exact published endpoint, a known host, and the publisher's `npm` adapter,
+  falling back to Chat Completions. A model ID never participates: a gateway
+  serving `gpt-*`, `claude-*` and `gemini-*` behind one Chat Completions route
+  keeps that route.
+- When the endpoint decided the format, the custom form says
+  "Auto detected: …" next to the selector. A format picked by hand — or a named
+  preset's own — outranks every inference from that point on.
+
+Discovery then probes the resolved candidates: at most four, deduplicated, in
+confidence order, all on the origin the user typed. The first candidate that
+publishes models wins, and the address it answered on becomes the Base URL the
+form shows and saves. The sweep shares one 12-second budget rather than giving
+each candidate its own, and it runs candidates serially because every request
+carries the user's API key. That key never reaches another origin, including
+across a redirect: a cross-origin redirect is refused instead of followed.
+Provider-specific paths (`/v1beta`, `/compatible-mode/v1`) come from the
+endpoint registry, never from a blanket heuristic, and are offered only when the
+host was named without a path: a typed path is that deployment's own answer, so
+a `/api/v1` that publishes nothing is reported instead of being swapped for the
+registry's `/api/paas/v4` sibling. The only generic extra path is `/v1` for an
+unknown OpenAI-compatible endpoint. Every published model-list shape is read —
+`data[].id`, Google's `models[].name`, and the `models[].slug` rows Zhipu's
+OpenAI Responses endpoint returns — so an endpoint that answers is never treated
+as empty. Connection testing reuses
+the same request builder, so "the model list loaded" and "the connection test
+passed" always describe the same URL, auth header and format. Anthropic-style
+endpoints that return 404 because they intentionally publish no model list may
+instead pass connection testing through a same-origin `OPTIONS /v1/messages`
+route probe; this proves reachability without sending credentials or a billable
+model request, while model IDs remain manual.
+
+### Which publisher a row is read against
+
+A row that names no publisher of its own is read against the publisher its
+endpoint identifies, in this order: the catalog entry whose published base URL
+matches, the endpoint registry for a known host, then the catalog's own host
+when exactly one provider publishes from it. That is what keeps a custom row on
+a vendor's alternative API path — `https://open.bigmodel.cn/api/v1` for Zhipu's
+OpenAI Responses endpoint — from showing generic 128k / 8k / text-only defaults
+for models the catalog describes in full.
+
+When nothing identifies a publisher at all — a relay, or a host the catalog does
+not know — the publishers this app ships a provider for answer first: they are
+the vendors and gateways behind the first-class presets, so their records
+describe the model, while a reseller's own flags describe its own deployment of
+it. Only when none of them states the ID does the pool widen to every publisher
+that does, because an ID a relay alone carries would otherwise be shown as a
+generic 128k text-only row. Within that pool the publishers' agreement is
+claimed: the lower median of their limits and, for every capability but tool
+support, only what all of them state, so the answer can only under-claim. Tool
+support follows the majority of the publishers that state it: an ID a relay lists
+can be stated by a hundred publishers, and one dissenting reseller must not decide
+— or void — the claim for a deployment it does not describe. An even split states
+no majority and claims nothing. Two routes that merely share a name leaf
+(`provider-a/foo` vs `gateway/foo`) are not one model, so an ID whose identity is
+genuinely unknown still resolves to nothing. A record borrowed this way states no
+reasoning wire shape — that is a property of the deployment — and an Anthropic
+Messages row keeps Anthropic's own shape. A model ID never decides which
+publisher is read.
+
+The lookup answers for the IDs a row already lists, so a served ID whose published
+record is an audio model — a TTS or ASR sibling — resolves to that record too.
+Only the catalog listing is scoped to text/agent models, because it decides which
+models a row offers.
+
+Metadata matching may follow a release stamp: `mify/mimo-v2.5-pro-0731` borrows
+the published record of `mimo-v2.5-pro`, and a record the catalog publishes
+under exactly the requested ID still wins over such an alias. The alias is
+metadata only: a configured binding keeps the wire ID the service served.
+
+Invalid or credential-bearing URLs still give no advice, and Cancel still does
+not persist draft changes.
+
+## 12. Manual model-list intent and the macOS Local Network trigger
+
+The settings form's **Fetch list** control is the one explicit manual model-list
+action. Its request — and only its request — carries
+`intent: "manual-fetch-list"` on `api.listProviderModels` and on the
+`pi-desktop/providers/listModels` handler. The field is transient: it never
+reaches the durable provider record, the host RPC (`providers.list`,
+`providers.getSecret`, `providers.cacheModels`), the Plugin SDK or the database.
+The channel name and the `{ models, source, error? }` response shape are exactly
+what they were before the field existed.
+
+Who sets it: `useProviderModels.reload()` (the Fetch list control) and nothing
+else. The edit debounce (600 ms), the saved-provider refresh on open, cache
+hydration, vendor-account discovery and every other caller omit it, and omission
+is exactly the previous behavior. `source: "refresh"` is not a manual-action
+proxy.
+
+Why the field exists: macOS attributes Local Network privacy to an application
+identity, and Apple documents a UDP `connect()` as an implicit alert trigger that
+sends no traffic. On a manual request only, and only on macOS, Electron main runs
+one supplemental trigger immediately before the HTTP discovery request, so the
+user can answer the alert while that request is in flight. The controller lives in
+`apps/desktop/electron/main/local-network-permission.ts`, is created once in
+`ipc/register.ts`, and is disposed on application shutdown.
+
+Authority boundary — what the trigger may and may not do:
+
+- It runs only for `intent === "manual-fetch-list"`, only on macOS, only on the
+  live discovery branch, and only for a provider that is not a vendor account.
+  Cache hydration and vendor-account discovery never run it, and no other intent
+  value enables it.
+- The endpoint must be a valid `http:`/`https:` URL without credentials. The probe
+  uses its effective port and nothing else: no headers, no payload, no
+  credentials, no broadcast, no multicast, no Bonjour browse.
+- Address classification reuses `classifyIpLiteral` from
+  `packages/shared/src/public-network.ts`. A target is eligible only as a
+  `private`, `link-local`, `ula` or `site-local` unicast address; loopback,
+  public, unspecified, multicast, documentation, benchmark (proxy fake-IP),
+  reserved, CGNAT and invalid addresses are never eligible, and `localhost` with
+  its subdomains is refused before any DNS. A direct hostname is resolved once
+  (`all: true`) and the first eligible address in resolver order is used.
+- Only a direct route is eligible. The controller asks the same Electron default
+  session that carries discovery fetch for its route; a proxied or unreadable
+  route skips the probe without touching transport configuration, and no direct
+  LAN bypass is ever created for proxied discovery.
+- The operation is bounded by a 1,500 ms total budget covering the route query,
+  the lookup and the connect. Concurrent operations for one endpoint coalesce,
+  nothing is memoized as granted, and the socket, timer and listeners are removed
+  on success, failure, deadline and disposal. The budget starts with the probe
+  itself, after the synchronous gates, so a coalesced caller shares the in-flight
+  probe instead of opening a second one and a refused endpoint leaves no timer.
+- An IPv6 zone identifier is stripped before classification and kept for the
+  connect, because a link-local neighbour is reachable only through the interface
+  the zone names. A scope-qualified `fe80::/10` literal is therefore eligible and
+  dialled exactly as the resolver or the user wrote it, while the scope-less form
+  — which cannot be connected safely — skips with its own reason. A scope-less
+  answer is named that way only when it explains every candidate that failed; a
+  mixed ineligible answer is the general `no-local-address`.
+- Verdicts are `skipped`, `attempted` or `failed`. **None of them means
+  permission was granted**: a UDP callback is trigger evidence only, and macOS
+  exposes no API that reads, forces or resets one application's choice. A
+  diagnostic carries the stage, the reason and a node error code only — never a
+  URL, a header, a query or a credential. A code travels only when it is a short
+  upper-case token (the same rule `public-https-fetch.ts` applies), so no arbitrary
+  resolver or socket text can ride along. A socket that cannot be created or a
+  synchronous `connect()` throw reports `failed` at the connect stage, because the
+  vocabulary has no separate reason for "no socket could be made"; an unexpected
+  throw always settles the caller rather than leaving it waiting.
+  timeout, the response and error handling, the cache write and the models.dev
+  catalog fallback all stay as they are. A failed or unfruitful trigger never
+  replaces the discovery result.
+
+If macOS refuses, the app does not re-prompt in a loop; the user enables
+Pi-Desktop-Plus in System Settings → Privacy & Security → Local Network and uses
+the same Fetch list control again. ADR plus-independent-application-identity records the identity half of this
+repair.

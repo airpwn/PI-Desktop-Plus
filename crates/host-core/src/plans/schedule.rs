@@ -8,12 +8,30 @@ const SCHEDULED: &str = "scheduled";
 const MISSED: &str = "missed";
 const CLAIMED: &str = "claimed";
 const CANCELLED: &str = "cancelled";
+const AUTOMATIC_CLAIM_GRACE_MS: i64 = 120_000;
+const ELIGIBLE_SCHEDULE: &str =
+    "s.state = ?1 AND p.status = 'approved' AND p.execution_state IS NULL";
 
-/// Mark due schedules as missed. This is intentionally a separate operation
-/// from `due_schedules`: callers that are running the host can claim due work,
-/// while restart maintenance can mark work that was not observed as missed.
 impl PlanManager {
+    /// Restart recovery has no catch-up window, even for a recently due schedule.
     pub fn mark_overdue_schedules_missed(&self, db: &Database, now_ms: i64) -> Result<Vec<String>> {
+        self.mark_schedules_missed_before(db, now_ms, now_ms)
+    }
+
+    /// Running-app polls allow at most two minutes of delay, including the boundary.
+    pub fn mark_delayed_schedules_missed(&self, db: &Database, now_ms: i64) -> Result<Vec<String>> {
+        let Some(cutoff) = now_ms.checked_sub(AUTOMATIC_CLAIM_GRACE_MS + 1) else {
+            return Ok(Vec::new());
+        };
+        self.mark_schedules_missed_before(db, now_ms, cutoff)
+    }
+
+    fn mark_schedules_missed_before(
+        &self,
+        db: &Database,
+        now_ms: i64,
+        cutoff: i64,
+    ) -> Result<Vec<String>> {
         let tx = db.conn().unchecked_transaction()?;
         let proposal_ids = {
             let mut stmt = tx.prepare_cached(
@@ -22,7 +40,7 @@ impl PlanManager {
                  WHERE state = ?1 AND scheduled_for <= ?2
                  ORDER BY scheduled_for ASC, proposal_id ASC",
             )?;
-            let rows = stmt.query_map(params![SCHEDULED, now_ms], |row| row.get(0))?;
+            let rows = stmt.query_map(params![SCHEDULED, cutoff], |row| row.get(0))?;
             rows.collect::<rusqlite::Result<Vec<String>>>()?
         };
 
@@ -30,8 +48,8 @@ impl PlanManager {
             tx.execute(
                 "UPDATE plan_execution_schedules
                  SET state = ?1, updated_at = ?2
-                 WHERE state = ?3 AND scheduled_for <= ?2",
-                params![MISSED, now_ms, SCHEDULED],
+                 WHERE state = ?3 AND scheduled_for <= ?4",
+                params![MISSED, now_ms, SCHEDULED, cutoff],
             )?;
             for proposal_id in &proposal_ids {
                 audit::append_tx(
@@ -52,23 +70,35 @@ impl PlanManager {
 
     /// Return approved schedules that are due and have not been claimed.
     pub fn due_schedules(&self, db: &Database, now_ms: i64) -> Result<Vec<String>> {
-        let mut stmt = db.conn().prepare_cached(
+        let sql = format!(
             "SELECT s.proposal_id
              FROM plan_execution_schedules s
              JOIN plan_approvals p ON p.request_id = s.proposal_id
-             WHERE s.state = ?1
-               AND s.scheduled_for <= ?2
-               AND p.status = 'approved'
-               AND p.execution_state IS NULL
-             ORDER BY s.scheduled_for ASC, s.proposal_id ASC",
-        )?;
+             WHERE {ELIGIBLE_SCHEDULE} AND s.scheduled_for <= ?2
+             ORDER BY s.scheduled_for ASC, s.proposal_id ASC"
+        );
+        let mut stmt = db.conn().prepare_cached(&sql)?;
         let rows = stmt.query_map(params![SCHEDULED, now_ms], |row| row.get(0))?;
         Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
     }
 
+    /// Return the earliest eligible future deadline; due work is returned separately.
+    pub fn next_due_at(&self, db: &Database, now_ms: i64) -> Result<Option<i64>> {
+        let sql = format!(
+            "SELECT MIN(s.scheduled_for)
+             FROM plan_execution_schedules s
+             JOIN plan_approvals p ON p.request_id = s.proposal_id
+             WHERE {ELIGIBLE_SCHEDULE} AND s.scheduled_for > ?2"
+        );
+        Ok(db
+            .conn()
+            .prepare_cached(&sql)?
+            .query_row(params![SCHEDULED, now_ms], |row| row.get(0))?)
+    }
+
     /// Atomically claim one schedule and create its queued execution record.
-    /// `allow_missed` is reserved for an explicit user-triggered run after a
-    /// restart; it never causes the scheduler to catch up automatically.
+    /// `allow_missed` is reserved for an explicit user-triggered Run now;
+    /// it never causes the scheduler to catch up automatically.
     pub fn claim_schedule(
         &self,
         db: &Database,
@@ -80,11 +110,11 @@ impl PlanManager {
             return Err(plan_error("PLAN_INVALID_ARGUMENT"));
         }
         let tx = db.conn().unchecked_transaction()?;
-        let schedule_state = tx
+        let (schedule_state, scheduled_for) = tx
             .query_row(
-                "SELECT state FROM plan_execution_schedules WHERE proposal_id = ?1",
+                "SELECT state, scheduled_for FROM plan_execution_schedules WHERE proposal_id = ?1",
                 params![proposal_id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()?
             .ok_or_else(|| plan_error("PLAN_SCHEDULE_NOT_FOUND"))?;
@@ -112,6 +142,24 @@ impl PlanManager {
         if proposal.status != STATUS_APPROVED || proposal.execution_state.is_some() {
             return Err(plan_error("PLAN_SCHEDULE_STALE"));
         }
+        if schedule_state == SCHEDULED
+            && !allow_missed
+            && now_ms.saturating_sub(scheduled_for) > AUTOMATIC_CLAIM_GRACE_MS
+        {
+            tx.execute(
+                "UPDATE plan_execution_schedules SET state = ?1, updated_at = ?2
+                     WHERE proposal_id = ?3 AND state = ?4",
+                params![MISSED, now_ms, proposal_id, SCHEDULED],
+            )?;
+            audit::append_tx(
+                &tx,
+                "plan_execution_schedule_missed",
+                Some(&proposal.session_id),
+                json!({"proposalId": proposal_id, "state": MISSED, "reason": "overdue"}),
+            )?;
+            tx.commit()?;
+            return Err(plan_error("PLAN_SCHEDULE_MISSED"));
+        }
         let session_busy: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM plan_approvals
                  WHERE session_id = ?1 AND request_id != ?2
@@ -128,15 +176,8 @@ impl PlanManager {
             .target_permission_mode
             .as_deref()
             .ok_or_else(|| plan_error("PLAN_PERMISSION_MODE_REQUIRED"))?;
-        if schedule_state == SCHEDULED {
-            let scheduled_for: i64 = tx.query_row(
-                "SELECT scheduled_for FROM plan_execution_schedules WHERE proposal_id = ?1",
-                params![proposal_id],
-                |row| row.get(0),
-            )?;
-            if scheduled_for > now_ms {
-                return Err(plan_error("PLAN_SCHEDULE_NOT_DUE"));
-            }
+        if schedule_state == SCHEDULED && scheduled_for > now_ms {
+            return Err(plan_error("PLAN_SCHEDULE_NOT_DUE"));
         }
 
         let execution_id = Uuid::new_v4().to_string();
@@ -234,5 +275,91 @@ impl PlanManager {
         }
         tx.commit()?;
         Ok(changed == 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn add_schedule(db: &Database, session_id: &str, id: &str, at: i64) {
+        db.conn().execute(
+            "INSERT INTO plan_approvals
+             (request_id, session_id, turn_id, tool_call_id, plan_json, status, created_at, updated_at)
+             VALUES (?1, ?2, 'turn', ?1, '# plan', 'approved', 1, 1)",
+            params![id, session_id],
+        ).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO plan_execution_schedules
+             (proposal_id, scheduled_for, timezone, state, updated_at)
+             VALUES (?1, ?2, 'UTC', 'scheduled', 1)",
+                params![id, at],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn next_due_at_shares_due_eligibility_and_excludes_the_due_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("pi.sqlite")).unwrap();
+        let session = sessions::create_session(&db, None, None, None, None, None).unwrap();
+        let manager = PlanManager;
+        assert_eq!(manager.next_due_at(&db, 1_000).unwrap(), None);
+        add_schedule(&db, &session.id, "later", 3_000);
+        add_schedule(&db, &session.id, "next", 2_000);
+        add_schedule(&db, &session.id, "due", 1_000);
+        add_schedule(&db, &session.id, "past", 999);
+        assert_eq!(manager.next_due_at(&db, 1_000).unwrap(), Some(2_000));
+        assert_eq!(
+            manager.due_schedules(&db, 1_000).unwrap(),
+            vec!["past", "due"]
+        );
+        for state in [MISSED, CLAIMED, CANCELLED] {
+            db.conn()
+                .execute(
+                    "UPDATE plan_execution_schedules SET state = ?1 WHERE proposal_id = 'next'",
+                    params![state],
+                )
+                .unwrap();
+            assert_eq!(manager.next_due_at(&db, 1_000).unwrap(), Some(3_000));
+        }
+        db.conn().execute("UPDATE plan_execution_schedules SET state = 'scheduled' WHERE proposal_id = 'next'", []).unwrap();
+        for status in [
+            STATUS_PENDING,
+            STATUS_REJECTED,
+            STATUS_CHANGES_REQUESTED,
+            STATUS_EXPIRED,
+            STATUS_INTERRUPTED,
+        ] {
+            db.conn()
+                .execute(
+                    "UPDATE plan_approvals SET status = ?1 WHERE request_id = 'next'",
+                    params![status],
+                )
+                .unwrap();
+            assert_eq!(manager.next_due_at(&db, 1_000).unwrap(), Some(3_000));
+        }
+        db.conn()
+            .execute(
+                "UPDATE plan_approvals SET status = 'approved' WHERE request_id = 'next'",
+                [],
+            )
+            .unwrap();
+        for state in [
+            EXECUTION_QUEUED,
+            EXECUTION_RUNNING,
+            EXECUTION_COMPLETED,
+            EXECUTION_INTERRUPTED,
+        ] {
+            db.conn()
+                .execute(
+                    "UPDATE plan_approvals SET execution_state = ?1 WHERE request_id = 'next'",
+                    params![state],
+                )
+                .unwrap();
+            assert_eq!(manager.next_due_at(&db, 1_000).unwrap(), Some(3_000));
+        }
+        assert_eq!(manager.next_due_at(&db, 3_000).unwrap(), None);
     }
 }

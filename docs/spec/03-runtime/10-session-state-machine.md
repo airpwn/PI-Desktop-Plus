@@ -88,6 +88,17 @@ A steering input is judged by the same identity: one that names a turn which was
 cancelled, has started finalizing, or no longer owns the session is refused as a
 turn that has ended.
 
+For Expert Team members, Host `phase` is a projection of the durable turn
+lifecycle, not task-board status. Successful turn admission sets `running` in
+the same transaction/savepoint as the turn row. Durable completion sets
+`completed`, error sets `failed`, and abort/interruption sets `idle` in the same
+terminal transaction. A rejected admission cannot leave a running phase, and a
+late/non-updating terminal event cannot overwrite a newer active turn. Recovery
+settles interrupted running turns before exposing the Team snapshot. A member
+turn completion does not complete its owned tasks. The Lead snapshot reports
+real current activity; Team-level waiting/completion also considers member
+phases, task states and queued Team mail, never the pause flag alone.
+
 ## 3. Transition rules
 
 1. Only one active turn per session
@@ -107,7 +118,9 @@ turn that has ended.
    tool row begins, abort preserves the partial transcript and restores no
    draft. The snapshot keeps structured file/image references and is never
    reconstructed by parsing model-facing `@path` text.
-5. Permission timeout moves to tool denied, then agent may continue or end based on runtime handling
+5. A local permission remains in `waiting_permission` until explicit allow,
+   deny, cancellation, or host shutdown; an explicit deny then moves to tool
+   denied and the agent may continue or end based on runtime handling
 6. Session status returns to idle after terminal turn states are persisted
 7. Changing the renderer's active project/session does not transition or abort
    any background session

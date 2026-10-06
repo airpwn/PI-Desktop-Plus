@@ -1,4 +1,4 @@
-import type { ProjectWorkspace, SessionSummary, SessionSort } from "@pi-desktop/shared";
+import type { ProjectWorkspace, SessionSort } from "@pi-desktop/shared";
 export type { SessionSort } from "@pi-desktop/shared";
 export { sortSessions, sessionIsPinned, sessionIsArchived } from "@pi-desktop/shared";
 
@@ -25,6 +25,9 @@ export type SessionMeta = {
   manualTitle?: boolean;
   /** Survives renderer restarts so an attempted automatic summarization does not recur. */
   autoTitleAttempted?: boolean;
+  autoTitleExecutionId?: string;
+  lastAutoTitle?: string;
+  teamExpanded?: boolean;
 };
 export const MAX_PROJECT_NAME_CHARS = 80;
 export type ProjectMeta = {
@@ -92,9 +95,6 @@ function object(value: unknown): value is Record<string, unknown> {
 function bool(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
-function number(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
 function manualOrder(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value
@@ -122,6 +122,14 @@ function cleanSessionMeta(value: unknown): Record<string, SessionMeta> {
     if (manualTitle !== undefined) item.manualTitle = manualTitle;
     const autoTitleAttempted = bool(raw.autoTitleAttempted);
     if (autoTitleAttempted !== undefined) item.autoTitleAttempted = autoTitleAttempted;
+    if (typeof raw.autoTitleExecutionId === "string" && raw.autoTitleExecutionId.trim()) {
+      item.autoTitleExecutionId = raw.autoTitleExecutionId.trim();
+    }
+    if (typeof raw.lastAutoTitle === "string" && raw.lastAutoTitle.trim()) {
+      item.lastAutoTitle = raw.lastAutoTitle.trim();
+    }
+    const teamExpanded = bool(raw.teamExpanded);
+    if (teamExpanded !== undefined) item.teamExpanded = teamExpanded;
     if (Object.keys(item).length) output[id] = item;
   }
   return output;

@@ -1,4 +1,4 @@
-# 04. 数据存储（架构 v21）
+# 04. 数据存储（共享架构 v19，Plus 轨道 v4）
 
 > **翻译说明：** 本页是与 [英文源规格](/spec/03-runtime/04-data-storage) 一一对应的机器辅助翻译。代码、协议字段和标识符保持原文；如翻译与英文源事实有歧义，以英文版本为准。
 
@@ -31,25 +31,29 @@
    查询、整数倍、单写入器 WAL、热路径上没有 JSON 扫描。
 4. **可扩展，无需迁移**，成本低廉（块词汇、JSONL 行
    类型、kv 命名空间、`config_json` 列），**带有迁移**，其中
-结构（新实体），由 `PRAGMA user_version` 版本化。
+结构（新实体），由 `PRAGMA user_version` 版本化，Plus 专有实体则由 Plus 轨道版本化（第 7.1 节）。
 5. **Plan/Goal 检查点是不可变的主机工件**，具有记录的路径，
    哈希值和大小；现有的批准行还带有执行字段。
    启动中断是进程纪元栅栏，并且不会重播任何工作。
 
 ## 2. 文件布局
 
-正式打包版把上述目录树放在 `~/.pi-desktop`；开发构建放在 `~/.pi-desktop-dev`，
-因为正式版与 `pnpm dev` 是两个需要同时运行的安装（D599、ADR 0094）。
+Plus 正式打包版把上述目录树放在 `~/.pi-desktop-plus`；开发构建放在 `~/.pi-desktop-plus-dev`，
+因为正式版与 `pnpm dev` 是两个需要同时运行的安装（D599、ADR 0094；本 fork 的路径由
+[独立应用身份](../../../adr/plus-independent-application-identity.md)修订）。
 `PI_DESKTOP_DATA_DIR` 会整体替换任一默认根目录，并在作为子进程环境变量传给
 host-core 之前被解析为绝对路径。
 
 ```text
-~/.pi-desktop/
+~/.pi-desktop-plus/
  ├── pi.sqlite            # index database (WAL: + -wal/-shm) — host-core only
  ├── pi.sqlite.v6.bak     # archived pre-v7 database (D119 breaking reset)
  ├── pi.sqlite.v8.bak     # exact readable backup before v8→v15 destructive work
  ├── pi.sqlite.v9.bak     # exact readable backup before v9→v15 destructive work
  ├── pi.sqlite.v10.bak    # exact readable backup before v10→v15 destructive work
+ ├── pi.sqlite.legacy-v<N>.bak # backup before a legacy fork database joins the Plus track (7.1)
+ ├── pi.sqlite.repair-v<N>.bak # backup before an older build's user_version change is undone (7.1)
+ ├── pi.sqlite.plus-v<N>.bak   # backup before pending Plus steps run on an existing database (7.1)
  ├── sessions/            # transcript file store (D119) — host-core only
  │    ├── <sessionId>.jsonl           # live transcript (header + messages)
  │    ├── <sessionId>.revisions.jsonl # regenerate branches, append-only
@@ -178,7 +182,8 @@ PRAGMA trusted_schema = ON;       -- required by the FTS triggers (§4.8); the D
 PRAGMA auto_vacuum = INCREMENTAL; -- set at creation, before any table
 ```
 
-- 架构版本位于 `PRAGMA user_version` (v15 = `15`) 中。 v1 `meta`
+- 共享架构版本位于 `PRAGMA user_version`（当前 v19 = `19`）中。Plus 专有结构
+  单独由 `plus_schema_meta` 版本化（当前 Plus 轨道 v4，第 7.1 节）。v1 `meta`
   桌子不见了。
 - host-core 是**单一作者**；语句使用 `prepare_cached`；每个
   多行写入在一个事务中运行。
@@ -596,6 +601,28 @@ CREATE UNIQUE INDEX idx_turn_queue_idempotency
 - 重启后模块列出全部条目，把每个会话的队列挂起到 controller 接入，并在活动回合终止事件
   之后释放一条。删除会话会级联删除其条目。
 
+**会话 Todo 清单——存储架构 v21**
+
+```sql
+CREATE TABLE session_todo (
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL CHECK (position >= 0 AND position < 50),
+  content TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'in_progress', 'completed', 'cancelled')),
+  priority TEXT NOT NULL DEFAULT 'medium' CHECK (priority IN ('high', 'medium', 'low')),
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (session_id, position)
+);
+```
+
+`sessions.todo_revision` 和 `sessions.todo_updated_at` 即使清单为空也保留顺序元数据。
+主机事务会更新这些字段、删除旧行并插入归一化后的替换清单；每次成功写入都会推进
+revision，包括清空。唯一的部分 `in_progress` 索引在数据库边界保证只有一个活动项。
+分叉会话从 revision 0 和空清单开始；删除会话会级联删除清单行。
+
+行内容在存储前会裁剪空白，限制为 500 个 Unicode 标量值且不得包含 NUL。
+TodoWrite 是唯一写入方；渲染器和 sidecar 只能通过 host RPC 访问该状态。
+
 ### 4.6c 会话协作 ledger —— 宿主拥有的投递状态（架构 v16）
 
 ```sql
@@ -658,7 +685,9 @@ CREATE UNIQUE INDEX idx_session_collaboration_receipt
   `UiMessage.sessionMessage` 投影到 UI。宿主校验阻止伪造、剥离、编辑或重新生成协作输入
   变成人类输入。该元数据是增量字段，不需要给 `messages` 增加列。
 
-### 4.6d Goal reports 与 Expert Team 状态（架构 v20-v21）
+### 4.6d Goal reports 与 Expert Team 状态（Plus 轨道 P1-P2）
+
+本节的结构由 Plus 步骤 P1 和 P2 创建（第 7.1 节），从不由共享的 `user_version` 链创建。
 
 Goal report 的身份和生命周期由 Host 存储在 `goal_reports`，以
 `execution_id` 为键并归属一个 session。报告正文通过原子发布写入
@@ -668,7 +697,7 @@ Goal report 的身份和生命周期由 Host 存储在 `goal_reports`，以
 删除 session 会级联删除记录并移除对应报告文件。报告内容不会从转录文本推断。
 迟到的草稿提交不能把 `ready` 或 `failed` 报告改回 `draft`；Host 在修改报告文件或记录前拒绝它。
 
-Expert Team 状态由 Host 存在三个表中（ADR 0307）：
+Expert Team 状态由 Host 存在三个表中（ADR plus-expert-team-collaboration）：
 
 - `teams` 以 Lead session 为键，保存 revision 和暂停状态。
 - `team_members` 将持久 member session 绑定到 Lead，保存 Team 内唯一名称、
@@ -713,8 +742,10 @@ type Block =
       status: "ok" | "error" | "denied"; result?: unknown;
       completedAt?: string; durationMs?: number;
       toolUsage?: ToolTokenUsage }
-  | { type: "attachment"; kind: "image" | "file"; name: string;
-      ref: string /* attachments/<sha256> or absolute path */ }
+  | { type: "attachment"; kind: "image" | "file" | "session"; name: string;
+      ref: string /* attachments/<sha256>、绝对路径或会话 id */;
+      mimeType?: string; size?: number;
+      text?: string /* 被引用对话的有界摘录 */ }
   | { type: "hostedSearch"; status: "searching" | "completed" | "failed";
       rounds: Array<{ id: string;
         status: "searching" | "completed" | "failed";
@@ -728,6 +759,11 @@ type Block =
 
 - 工具结果存储**截断后**（16 个工具结果限制）；满
   原始输出不是存储问题。
+- `kind: "session"` 块是会话引用：它存储被引用的会话 id、显示标题，以及引用给模型的
+  有界摘录，因此后续轮次读到的是同一份引用，而不必重新读取被引用的对话。摘录边界、
+  同项目规则与 `<session_reference>` 提示块属于引用契约
+  （`04-ux/08-component-spec.md` §20B）；宿主只存它拿到的东西，不会为了拼出一条引用
+  去读被引用的会话。
 - 辅助思维仅存储在文件内的 `thinking` 块中。的
   派生的 `text` 列包含最终答案文本，因此转录搜索和
   答案预览不会暴露或混合推理。
@@ -895,7 +931,7 @@ CREATE TABLE scheduled_tasks (
   id          TEXT PRIMARY KEY,
   title       TEXT NOT NULL,
   prompt      TEXT NOT NULL,
-  cadence     TEXT NOT NULL DEFAULT 'manual',  -- manual | hourly | daily | weekly
+  cadence     TEXT NOT NULL DEFAULT 'manual',  -- manual | hourly | interval | daily | weekly
   enabled     INTEGER NOT NULL DEFAULT 1,
   project_id  INTEGER REFERENCES projects(id) ON DELETE SET NULL,
   config_json TEXT NOT NULL DEFAULT '{}',      -- mode, cron expr, model override, notify policy
@@ -917,11 +953,14 @@ CREATE INDEX idx_task_runs ON task_runs(task_id, started_at DESC);
 ```
 
 生成会话的运行通过 `session_id` 免费获取其转录本。
-`config_json` 保存 `schedule: {hour, minute, weekday}`、毫秒时间戳 `nextRunAt`、
-`workspacePath`，以及可选的任务级 `permissionMode` 与成对的 `providerId`／`modelId`。
+该转录本通过针对 `task_runs` 的 `EXISTS` 判断被识别为自动化产出，每个会话摘要与搜索命中都以 `scheduledRun` 返回这一归属。归属在读取时派生、不写入会话行：因此在该会话仍属于某次运行时，会话列表与会话搜索会隐藏它；删除任务后它会回到普通列表，而不会变得无法访问（issue #1291）。
+`scheduled.listRuns` 提供两种形状：单任务自己的历史（`taskId`，最多 200 条）与每任务最新一次运行（`latestPerTask`，每个任务一行，不能与 `taskId` 同时使用）。任务列读取后者：`task_runs` 的全局窗口可能被某个繁忙任务填满（保留策略是按任务各留最近 100 条），那样空闲任务会被误报为「尚未运行」，所以喂给任务列的读取按任务而不是共享窗口。
+保留策略按任务各留最近 100 条运行（`TASK_RUNS_KEEP`，每次打开数据库时执行）。归属由这些行派生，因此一条被清理的运行会带走两件事：它从任务历史里消失，其会话也不再带 `scheduledRun`，于是那段转写回到会话列表与全局搜索。运行速度快于保留窗口的任务——`interval` 从 5 分钟起、每小时周期约四天后——会碰到这条边界；用持久化 origin 取代派生标记的改法与 issue #1291 的后续一起跟踪。任务页每次最多读取 200 条运行，这是 `scheduled.listRuns` 对单任务历史的上限。
+
+`config_json` 保存 `schedule: {hour, minute, weekday}`、`intervalMinutes`（5–1440，只有 `interval` 周期读取，因此保留该字段的排程会保留它的值）、毫秒时间戳 `nextRunAt`、`workspacePath`、会话模式 `sessionMode`（`perRun` 或 `reuse`，缺失按 `perRun`），以及可选的任务级 `permissionMode` 与成对的 `providerId`／`modelId`。
 这些新增字段无需物理表迁移。缺少模型字段时仍在运行时读取应用默认值；缺少权限字段时，
-自动运行继续使用 Ask，立即运行继续继承全局权限。每天、每周按宿主本地时区计算。每小时采用 `nextRunAt = now + 3_600_000`，
-忽略日历时间字段。可选 `weekdays` 保存 1–7 个不重复的 0–6 整数，覆盖每周的旧 `weekday`；
+自动运行继续使用 Ask，立即运行继续继承全局权限。每天、每周按宿主本地时区计算；每小时与间隔按准入时刻起算的经过时间计算：每小时采用 `nextRunAt = now + 3_600_000`，间隔采用 `nextRunAt = now + intervalMinutes × 60_000`，两者都忽略日历时间字段。
+`interval` 任务的排程若缺少 `intervalMinutes`，写入会被拒绝，而不是保存成永不触发的任务。可选 `weekdays` 保存 1–7 个不重复的 0–6 整数，覆盖每周的旧 `weekday`；
 缺失时保留单日语义，空数组、重复或越界值在写入前拒绝。无需表结构迁移。
 无 `schedule` 的旧任务不会自动运行；无需修改表或迁移数据库。见 ADR 0305。
 
@@ -1140,18 +1179,19 @@ outbox 排空。渲染器侧的停止绝不重写已有已开始回复的转录
 - JSON 列在热路径上盲读（按原样发送到渲染器）；
   任何过滤或求和的内容都是按规则提升的列。
 
-## 7. 版本控制、v7 重置和 v8 到 v21 迁移
+## 7. 版本控制、v7 重置和 v8 到 v19 迁移
 
-- `PRAGMA user_version` 保留模式权限；未来的结构性变化
+- `PRAGMA user_version` 仍是与上游 PI-Desktop 共享的迁移链的模式权限；该链未来的结构性变化
   再次添加有序的 Rust 迁移 fns，每个都在一个事务中，并带有一个
-  `pi.sqlite.v<n>.bak` 在破坏性步骤之前进行复制。
+  `pi.sqlite.v<n>.bak` 在破坏性步骤之前进行复制。Plus 专有的结构性变化
+  从不推进它，而是运行在 Plus 轨道上（第 7.1 节）。
 - **v7 是一个中断重置 (D119)，而不是迁移。** 使用以下命令打开数据库
   `user_version` 1–6 WAL 检查点，将其重命名为 `pi.sqlite.v6.bak`
   （删除过时的 `sessions/<id>.jsonl`/`idx_sessions_updated` 同级文件），并引导一个新的 v7 文件。
   旧文件中的会话、提供程序和设置不会保留；
   存档仍保留以供手动恢复。所有 v7 之前的迁移代码
   （v1 `settings.sqlite` 导入，v2→v6 链）被删除。
-- 全新安装直接运行完整的 v21 DDL。
+- 全新安装直接运行完整的 v19 DDL，然后运行 Plus 步骤（第 7.1 节）。
 - **架构 v15 是增量的。** 它增加 `turn_queue` 表及其两个索引（D386 / ADR 0213），使 Host
   拥有的回合队列在重启后存活；不改动任何已有行，迁移前保留 `pi.sqlite.v14.bak`。
 - **架构 v16 是增量的。** 它增加会话协作 link 和投递表、生命周期索引，以及可为空的
@@ -1163,13 +1203,6 @@ outbox 排空。渲染器侧的停止绝不重写已有已开始回复的转录
   v15→v16 会话协作步骤现在写入 `16`（它自己的版本）而不是最新的架构常量，
   因此 v15 文件可以在一次启动中走完两个步骤。
 - **架构 v18 到 v19 是增量的。** 它增加 `omit` thinking level，同时保留已存会话设置（ADR 0295）。
-- **架构 v19 到 v20 是增量的。** 它增加
-  `plan_approvals.artifact_workspace_kind` 和 Goal completion `goal_reports`；事务前保留
-  `pi.sqlite.v19.bak`。
-- **架构 v20 到 v21 是增量的。** 它增加 `sessions.execution_profile` 以及
-  `teams`、`team_members`、`team_tasks`（ADR 0307）。该步骤也会幂等补齐 Goal v20 对象，
-  因此来自任一未发布 v20 分支的数据库都能保留数据升级。事务前保留
-  `pi.sqlite.v20.bak`。
 - **架构 v7 首先到达 v8，然后使用受保护的路径。** v7→v8
   迁移之后是相同的受保护的 v8→v15 迁移；架构-v9 和
   schema-v10 数据库采用相同的受保护路径并接收精确的可读数据
@@ -1233,6 +1266,43 @@ outbox 排空。渲染器侧的停止绝不重写已有已开始回复的转录
 - 转录文件格式在会话中携带自己的 `schema` 字段
   标题行；未知的行类型会被跳过，因此文件格式会增加
   无需重置。
+
+### 7.1 Plus 轨道
+
+`PRAGMA user_version` 专用于与上游 PI-Desktop 共享的迁移链，只在合入上游迁移时才会前进
+（ADR plus-schema-version-track）。Plus 专有结构运行在同一数据库内的第二条轨道上，
+因此合入上游永远不会重编号，也不会与 Plus 数据冲突。Plus 步骤有序、仅增量且幂等。
+它们位于 `crates/host-core/src/db/plus_schema.rs`，当前轨道版本为 4：
+
+| 步骤 | 增加 |
+|---|---|
+| P1 | `plan_approvals.artifact_workspace_kind` 和 `goal_reports` 表 |
+| P2 | `sessions.execution_profile` 以及 `teams`、`team_members`、`team_tasks` 表 |
+| P3 | `plan_approvals` 上的执行 provider/model 绑定和修订意图字段，以及 `plan_execution_schedules` 表 |
+| P4 | `plan_approvals.execution_kind`，对已批准的提案按 `kind` 回填 |
+
+P1 到 P4 是早期 fork 构建以 `user_version` 20 到 23 发布的 Plus 专有变更。每个步骤在改动前都会先探测，
+因此来自任一未发布 v20 形态（仅 Goal reports，或仅 workspace kind）的数据库都能保留数据完成升级，
+旧提案仍可读取，可选绑定与调度状态为空。新增 Plus 变更时追加一个步骤并提升轨道版本；
+已应用的步骤永不修改。
+
+- **状态。** `plus_schema_meta` 只有一行（`id = 1`）：`plus_version`，以及 `upstream_version`——
+  上一次识别 Plus 的打开结束时留下的 `user_version`。
+- **打开顺序。** `Database::open` 先对账 Plus 轨道，再运行不变的共享链，最后应用或重新校验 Plus 步骤。
+- **更新的数据库。** 高于当前构建的 `plus_version` 会被拒绝，错误为
+  `Plus schema version N is newer than supported M`。启动诊断把它与共享链的拒绝同样对待
+  （`DB_SCHEMA_TOO_NEW`，见进程模型中的启动结果一节）。
+- **旧版 fork 数据库。** 含有 Plus 结构、没有 `plus_schema_meta` 且 `user_version` 为 20 到 23
+  的数据库由早期 fork 构建写入。在经过校验的 `pi.sqlite.legacy-v<N>.bak` 之后，一个事务应用全部
+  Plus 步骤、写入 meta（轨道 4，共享 19），并把 `user_version` 设为 19。失败则回滚事务，
+  旧版数据库保持原样。
+- **较旧的 fork 构建。** 较旧的 fork 构建打开已对账的数据库时，会重新运行自己幂等的步骤，
+  并把 `user_version` 留在 20 到 23。本构建下一次打开时先保留 `pi.sqlite.repair-v<N>.bak`，
+  再恢复 meta 记录的 `user_version`，不会显示降级横幅。
+- **待应用步骤。** Plus 轨道落后的数据库先保留 `pi.sqlite.plus-v<from>.bak`，再在一个事务中
+  应用缺失的步骤并更新 meta。当共享版本在本次打开期间或自 meta 写入以来发生变化时，
+  会重放全部步骤（上游步骤可能重建了带有 Plus 列的表），并重新同步 meta。
+- **全新安装。** 新数据库运行共享的 v19 DDL，再运行全部 Plus 步骤并记录轨道版本，不产生备份。
 
 ## 8. 保留和维护
 
@@ -1375,3 +1445,16 @@ preference does not rewrite provider configuration or require a schema migration
 schedule 就推断为日历配置；旧版 Hourly 行保留字段，但转换时需要明确确认日历时间。
 已知意图在周期切换和数据库重开后仍然保留。该新增 JSON 字段不需要表或 schema
 版本迁移；旧版本会忽略它，也无法执行新的转换保护。
+
+
+## Physical operation usage ledger
+
+Optional operation ID, origin, physical account/model and cost status augment
+existing message/turn usage. `session.recordUsage` merges identities into the
+existing turn `usage_json`; no schema migration or historical rewrite is needed.
+Identified records are idempotent across event replay, outbox retries, tool results
+and parent/subagent rollups. Legacy token-only rows remain readable and additive.
+An unknown price is distinct from a known zero price; partial known costs remain
+on the individual operations. Late usage targets its captured turn and does not
+revive it or debit the currently active turn. Immediate nested parent and owning
+Task remain separate optional transcript/event fields.

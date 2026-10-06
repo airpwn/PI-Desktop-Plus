@@ -30,9 +30,8 @@ test("home sidebar exposes only the supported destination entries", () => {
   assert.match(sidebarSource, /data-nav="home"/);
   assert.match(sidebarSource, /data-nav="plugins"/);
   assert.doesNotMatch(sidebarSource, /data-nav="projects"/);
-  assert.doesNotMatch(sidebarSource, /data-nav="pulls"/);
   assert.match(sidebarSource, /data-nav="scheduled"/);
-  assert.doesNotMatch(sidebarSource, /t\("nav\.(?:pullRequests|scheduled)"\)/);
+  assert.doesNotMatch(sidebarSource, /t\("nav\.scheduled"\)/);
 });
 
 test("sidebar brand returns to the chat home", () => {
@@ -122,7 +121,8 @@ test("sidebar shows a bounded standalone session list before retained projects",
   assert.match(standaloneSessions, /t\("nav\.sessions"/);
   assert.match(standaloneSessions, /data-action="new-standalone-session"/);
   assert.match(standaloneSessions, /createSession\(\{ projectPath: null \}\)/);
-  assert.match(standaloneSessions, /renderSessionRows\(temporarySessionHistory/);
+  assert.match(standaloneSessions, /groupTeamSessions\(temporarySessions\)/);
+  assert.match(standaloneSessions, /renderSidebarSessionGroup\(group/);
   assert.ok(
     sidebarSource.indexOf('data-sidebar-session-section="temporary"') <
       sidebarSource.indexOf('data-action="new-project"'),

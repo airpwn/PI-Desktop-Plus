@@ -1,4 +1,4 @@
-# 04. Data Storage (Schema v22)
+# 04. Data Storage (Shared schema v19, Plus track v4)
 
 ## 0. Ownership decision
 
@@ -30,36 +30,102 @@ schema v7, v8, v11, and v14:
    message content.
 4. **Extensible without migrations** where cheap (block vocabulary, JSONL line
    types, kv namespaces, `config_json` columns), **with migrations** where
-   structural (new entities), versioned by `PRAGMA user_version`.
+   structural (new entities), versioned by `PRAGMA user_version`, or by the
+   Plus track for Plus-only entities (section 7.1).
 
 Project groups use the existing `kv` extension boundary rather than a new
 relational schema. The host stores one JSON record per group in the
 `projectGroups` namespace, shared memory in `projectGroupMemory`, and shared
 instructions in `projectGroupInstructions`. The record contains the stable group
 id, display name, ordered canonical roots, primary root, timestamps, and optional
-`detachedPaths`. Removed roots stay in `detachedPaths` so an old path project
-record is not recreated as a standalone legacy group; sessions and files are not
-deleted. Existing path projects are projected as legacy single-root groups at
-read time; their path-scoped memory and filesystem instructions remain readable.
+`detachedPaths`. Removed roots without sessions stay in `detachedPaths` so an old
+path project record is not recreated as a standalone legacy group. A removed root
+with sessions is omitted from `detachedPaths` and remains readable as a standalone
+legacy group; removing a root from group membership never deletes sessions or files.
+Existing path projects are projected as legacy single-root groups at read time;
+their path-scoped memory and filesystem instructions remain readable.
 5. **Plan/Goal checkpoints are immutable host artifacts** with recorded path,
    hash, and size; the existing approval row also carries execution fields.
    Startup interruption is the process-epoch fence and no work is replayed.
 
 ## 2. File layout
 
-A packaged installation keeps this tree in `~/.pi-desktop`. A development build
-keeps the same tree in `~/.pi-desktop-dev`, because a shipped app and a
+### User-selected storage location (issue #1213)
+
+Settings → General → Storage can select an empty directory on a different
+volume. A selected directory contains `data/` (the complete host/application
+profile) and `browser/` (Chromium default and persistent plugin/browser session
+state). The existing default directories remain unchanged until the user
+explicitly migrates. Project files outside the application profile are not moved.
+
+The original Electron `userData` directory remains the installation identity,
+single-instance lock, and owner-only `storage-location.json` bootstrap anchor.
+Chromium `sessionData` follows `browser/`; this preserves existing localStorage,
+cookies, IndexedDB and persistent partition state by copying the complete old
+profile. An explicit `PI_DESKTOP_DATA_DIR` still overrides the default and disables
+settings-driven maintenance, since such profiles opt out of the installation lock.
+A managed relaunch discards only the environment root published for child services
+through the internal `--pi-managed-storage` argument before reacquiring the lock.
+The location is machine-local and never part of cloud configuration sync.
+
+Migration is cold: the accepted settings action journals pending work, then uses
+existing ordered shutdown to settle turns/outbox and stop writers. The next launch
+opens only a sandboxed, nonpersistent maintenance window before importing the
+application composition root. It inventories bytes/files, checks free space, streams
+the copy, preserves permissions and internal/external links, and SHA-256 verifies
+both source and copied files. An interrupted copy may be retried only with its
+matching ownership marker; nonempty/unrelated destinations and overlapping roots
+are rejected. The stable installation lock prevents competing managed launches.
+
+Rust's offline `--relocate-data <old-root> <copied-root>` mode owns structured
+path relocation in the copied SQLite index, transcripts/revisions/checkpoints,
+outbox, installed plugin registry and agent capability metadata. It does not boot
+RPC, upgrade schemas, recover turns, or sweep scratch, and it never joins a
+database to the Plus track (section 7.1). It changes only known
+path-bearing fields under the old root. External projects, dev/builtin plugins,
+narrative text, commands, source code, secrets, and arbitrary plugin-private formats
+are preserved. Credentials and their machine key migrate as bytes with their
+permissions. SQLite ownership stays exclusively in Rust.
+
+Only after validation/relocation succeeds is the flushed bootstrap pointer
+atomically replaced. Errors keep the old profile active and visible in settings;
+retrying the same destination uses the failed job's ownership identity. A crash
+before publication leaves pending work to recopy from the source. An unavailable
+selected volume refuses startup rather than creating a blank profile elsewhere.
+Original directories remain explicit backups. Deleting these requires a separate
+settings confirmation after checking new-location functionality, including plugins
+that may own absolute references the host cannot safely rewrite. Backup cleanup
+preflights every root and protects active storage and bootstrap/lock files.
+
+Cache cleanup is a separate confirmed cold-restart operation. Its filesystem
+allowlist is `cache/`, `plugins/cache/download/`, `plugins/cache/backup/`,
+`openable-attachments/`, and Chromium's Cache/Code Cache/GPU/shader cache
+folders in the default profile and persistent partitions. Intermediate or leaf
+symlinks cannot redirect cleanup, even within the same profile. It never clears
+cookies/localStorage/IndexedDB, transcripts, attachments, secrets, scratch,
+review snapshots, plugin code/data, models, configuration, or logs. Partial cleanup
+failure remains observable, retains active roots, and can be retried.
+
+
+A packaged Plus installation keeps this tree in `~/.pi-desktop-plus`. A
+development build keeps the same tree in `~/.pi-desktop-plus-dev`, because a
+shipped app and a
 `pnpm dev` host are two installations that have to run at the same time (D599,
-ADR 0094). `PI_DESKTOP_DATA_DIR` replaces either root outright and is resolved
+ADR 0094, amended for this fork by
+[independent identity](../../adr/plus-independent-application-identity.md)).
+`PI_DESKTOP_DATA_DIR` replaces either root outright and is resolved
 to an absolute path before it reaches host-core as a child-process variable.
 
 ```text
-~/.pi-desktop/
+~/.pi-desktop-plus/
  ├── pi.sqlite            # index database (WAL: + -wal/-shm) — host-core only
  ├── pi.sqlite.v6.bak     # archived pre-v7 database (D119 breaking reset)
  ├── pi.sqlite.v8.bak     # exact readable backup before v8→v15 destructive work
  ├── pi.sqlite.v9.bak     # exact readable backup before v9→v15 destructive work
  ├── pi.sqlite.v10.bak    # exact readable backup before v10→v15 destructive work
+ ├── pi.sqlite.legacy-v<N>.bak # backup before a legacy fork database joins the Plus track (7.1)
+ ├── pi.sqlite.repair-v<N>.bak # backup before an older build's user_version change is undone (7.1)
+ ├── pi.sqlite.plus-v<N>.bak   # backup before pending Plus steps run on an existing database (7.1)
  ├── sessions/            # transcript file store (D119) — host-core only
  │    ├── <sessionId>.jsonl           # live transcript (header + messages)
  │    ├── <sessionId>.revisions.jsonl # regenerate branches, append-only
@@ -122,6 +188,24 @@ per message; `seq` is implied by line order:
 {"type":"message","id":"m3","role":"assistant","createdAt":"…","blocks":[{"type":"thinking","text":"…"},{"type":"text","text":"…"}],"meta":{"usage":{},"modelId":"…"}}
 {"type":"compaction","id":"cp1","summary":"…","firstKeptMessageId":"m2","throughMessageId":"m3","tokensBefore":917000,"retainedTail":[…],"providerId":"…","modelId":"…","createdAt":"…"}
 ```
+
+Internal system-state rows use role `system`, empty visible content, and optional
+`meta.modelSystem = { version: 1, messageJson, beforeMessageId?, afterMessageId? }`.
+`messageJson` is validated JSON text of a Pi system message with sections and tool
+schema deltas; executable functions are excluded. JSON text preserves section and schema key
+order across Rust storage; parsing for validation never reserializes it. Stable row IDs make retries
+idempotent. The anchors restore logical model order when a user row was already
+persisted before its preceding declaration; a surviving following anchor takes
+precedence, then a preceding anchor, then the record's continuation position.
+Forks remap surviving anchor IDs. Normal system notices remain visible; internal
+model-state rows do not produce transcript bubbles or search text.
+
+Compaction details may include one `systemMessageJson` checkpoint. It replaces old
+system updates in the retained tail and is restored before the summary. These
+optional metadata fields use the existing JSONL/SQLite index and require no
+schema migration. Old sessions remain readable; their first continuation records
+a new baseline. Older app versions ignore the metadata and reconstruct their
+usual current prompt, so downgrade does not promise the same cache prefix.
 
 `sessions/<sessionId>.inflight.json` — the assistant reply currently
 streaming in the session, as one `{ schema, sessionId, turnId, savedAt,
@@ -238,8 +322,9 @@ PRAGMA trusted_schema = ON;       -- required by the FTS triggers (§4.8); the D
 PRAGMA auto_vacuum = INCREMENTAL; -- set at creation, before any table
 ```
 
-- Schema version lives in `PRAGMA user_version` (current v22 = `22`). The v1 `meta`
-  table is gone.
+- The shared schema version lives in `PRAGMA user_version` (current v19 = `19`).
+  Plus-only structures are versioned separately in `plus_schema_meta` (current
+  Plus track v4, section 7.1). The v1 `meta` table is gone.
 - host-core is the **single writer**; statements use `prepare_cached`; every
   multi-row write runs in one transaction.
 - Boot maintenance runs before RPC service: one transaction marks every
@@ -678,7 +763,7 @@ Serves: mid-session model switches ("next turn only", spec 13 §4), the
 per-message cost chip's session rollup (benchmark §3.2), failed/aborted badges
 (§3.8), and retry lineage.
 
-### 4.6b turn_queue — Host-owned turn queue (schema v15)
+### 4.6b turn_queue — Host-owned turn queue (introduced in schema v15)
 
 ```sql
 CREATE TABLE turn_queue (
@@ -689,9 +774,12 @@ CREATE TABLE turn_queue (
   input_hash       TEXT NOT NULL,
   content          TEXT NOT NULL,
   attachments_json TEXT,
+  session_message_id TEXT,
+  user_message_id TEXT,
   permission_mode  TEXT NOT NULL,
   position         INTEGER NOT NULL,
   priority         INTEGER,
+  voice_origin_json TEXT,
   created_at       INTEGER NOT NULL
 );
 CREATE INDEX idx_turn_queue_session ON turn_queue(session_id, position);
@@ -713,12 +801,41 @@ CREATE UNIQUE INDEX idx_turn_queue_idempotency
   promoted entries are delivered first in click order and the remaining entries
   keep their `position` order. `queueReorder` swaps two adjacent non-promoted
   `position` values and refuses a promoted entry.
+- `user_message_id` and `voice_origin_json` (schema v20) retain the stable
+  user-message identity and optional Live Voice operation provenance across
+  restart. They are metadata only: queue recovery still does not replay work.
   `IDEMPOTENCY_CONFLICT`. A session holds at most eight entries.
 - `attachments_json` keeps the prompt's attachment references; bytes stay in
   the session scratch or project root like any other prompt attachment.
 - After a restart the module lists every entry, holds each session's queue
   until a controller attaches, and drains one entry after the active turn's
   terminal event. Deleting the session cascades to its entries.
+
+**Session Todo checklist — schema v21**
+
+```sql
+CREATE TABLE session_todo (
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL CHECK (position >= 0 AND position < 50),
+  content TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'in_progress', 'completed', 'cancelled')),
+  priority TEXT NOT NULL DEFAULT 'medium' CHECK (priority IN ('high', 'medium', 'low')),
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (session_id, position)
+);
+```
+
+`sessions.todo_revision` and `sessions.todo_updated_at` retain ordering metadata
+even when the checklist is empty. A host transaction updates those fields,
+deletes the prior rows, and inserts the normalized replacement. The revision
+advances for every successful write, including a clear. A unique partial
+`in_progress` index enforces the single active item invariant at the database
+boundary. Forks begin with revision zero and no rows; session deletion cascades
+the rows.
+
+The row content is bounded at 500 Unicode scalar values, contains no NUL, and
+is trimmed before storage. TodoWrite is the only writer; renderer and sidecar
+code access this state through host RPC.
 
 ### 4.6c session collaboration ledger — Host-owned delivery state (schema v16)
 
@@ -793,7 +910,10 @@ CREATE UNIQUE INDEX idx_session_collaboration_receipt
   collaboration input from becoming ordinary human input. This metadata is
   additive and does not require a column in `messages`.
 
-### 4.6d Goal reports and Expert Team state (schema v20-v21)
+### 4.6d Goal reports and Expert Team state (Plus track P1-P2)
+
+The structures in this section are created by Plus steps P1 and P2 (section
+7.1), never by the shared `user_version` chain.
 
 Goal report identity and lifecycle are Host-owned in `goal_reports`, keyed by
 `execution_id` and scoped to a session. A report body is atomically published
@@ -806,7 +926,15 @@ from transcript text.
 Submitting a late draft cannot move a `ready` or `failed` report back to
 `draft`; the Host rejects it before changing either the report file or row.
 
-Expert Team state is stored in three Host-owned tables (ADR 0307):
+Real-time goal progress snapshots are stored in Host KV under namespace `goal_progress_v1`,
+keyed by `executionId`. The snapshot payload follows `GoalProgressSnapshot`:
+`{ schemaVersion: 1, sessionId, proposalId, executionId, revision, items: Array<{ id, label, status }>, updatedAt }`.
+Private write tokens are transiently held in Host KV under namespace `goal_progress_auth_v1`
+bound to the running execution ID, active turn ID, and session ID. These are additive KV entries
+and require no database migration. Tokens are deleted atomically when an execution finishes
+and cleared at Host startup. Session deletion removes both snapshot and authorization entries.
+
+Expert Team state is stored in three Host-owned tables (ADR plus-expert-team-collaboration):
 
 - `teams` is keyed by the Lead session and stores revision and pause state.
 - `team_members` binds durable member sessions to the Lead, with a unique name
@@ -814,9 +942,39 @@ Expert Team state is stored in three Host-owned tables (ADR 0307):
 - `team_tasks` stores the revisioned shared task board, owner, dependencies,
   advisory write scopes, status, and soft-delete marker.
 
+Optional role/display-name presentation is stored in the existing Host KV
+store under namespace `team-member-presentation-v1`, keyed by durable member
+Session ID. It is copied from a `TeamLaunchReviewMember` only in the confirmed
+review transaction. Old reviews without this field remain valid. Session list
+and search projections derive the optional `SessionSummary.team` relation by
+joining existing Team tables; this is not a new SQL column. These additions do
+not change the Plus track version or the existing ownership of Team/Session
+data.
+
 Deleting a member session while it belongs to a Team is rejected. Deleting the
 Lead atomically resets member sessions to `standard` and removes Team state;
 member sessions and their transcripts remain ordinary independent sessions.
+
+Lead creation and explicit configuration to the Team profile create the Team
+row in the session transaction. Legacy snapshot bootstrap is restricted to a
+live Team Lead that is not any other Team's member. The existing KV namespace
+`team-lifecycle-v1` stores `{ "dissolved": true }` by Lead ID after dissolution
+or an empty Team's conversion to `standard`; a read cannot revive that Team.
+Explicit conversion back to Team clears this marker in the same transaction.
+The marker is additive KV state and requires no schema migration.
+
+Deletion checks live Plan/Goal gates before any Team mutation. Team cleanup
+and Lead deletion commit together; transcript files are removed only after
+commit. A failed deletion preserves Team members, tasks, review and mail.
+Conversion to `standard` is refused with `TEAM_LEAD_CONFIGURATION_BLOCKED`
+while member, task, mailbox, review or decision data exists. Empty Teams can
+convert atomically without losing another session's data.
+
+Project removal preflights running turns, live Goal restrictions and Team
+membership before mutating project records. Leads are removed before members
+in the same deletion set. Members outside the removed project survive as
+standard sessions; removing a member whose Lead is outside the deletion set
+is blocked by the existing member deletion gate.
 
 ### 4.7 messages — transcript index
 
@@ -852,9 +1010,10 @@ type Block =
       status: "ok" | "error" | "denied"; result?: unknown;
       completedAt?: string; durationMs?: number;
       toolUsage?: ToolTokenUsage }
-  | { type: "attachment"; kind: "image" | "file"; name: string;
-      ref: string /* attachments/<sha256> or absolute path */;
-      mimeType?: string; size?: number }
+  | { type: "attachment"; kind: "image" | "file" | "session"; name: string;
+      ref: string /* attachments/<sha256>, absolute path, or session id */;
+      mimeType?: string; size?: number;
+      text?: string /* bounded referenced-conversation excerpt */ }
   | { type: "hostedSearch"; status: "searching" | "completed" | "failed";
       rounds: Array<{ id: string;
         status: "searching" | "completed" | "failed";
@@ -877,6 +1036,13 @@ type Block =
   `scratch/<sessionId>/replayed/` when a path fallback is required. Images
   above the inline bound are hashed and copied with streaming file operations;
   startup and history hydration must not load the whole image into memory.
+- A `kind: "session"` block is a conversation reference: it stores the session
+  id it names, the display title, and the bounded excerpt quoted to the model,
+  so a later turn reads the same reference instead of re-reading the referenced
+  conversation. The excerpt bound, the same-project rule, and the
+  `<session_reference>` prompt block belong to the reference contract
+  (`04-ux/08-component-spec.md` §20B); the host stores exactly what it is given
+  and never reads the referenced session to build one.
 - Assistant thinking is stored only in `thinking` blocks inside the file. The
   derived `text` column contains final answer text, so transcript search and
   answer previews do not expose or mix reasoning.
@@ -1064,7 +1230,7 @@ CREATE TABLE scheduled_tasks (
   id          TEXT PRIMARY KEY,
   title       TEXT NOT NULL,
   prompt      TEXT NOT NULL,
-  cadence     TEXT NOT NULL DEFAULT 'manual',  -- manual | hourly | daily | weekly
+  cadence     TEXT NOT NULL DEFAULT 'manual',  -- manual | hourly | interval | daily | weekly
   enabled     INTEGER NOT NULL DEFAULT 1,
   project_id  INTEGER REFERENCES projects(id) ON DELETE SET NULL,
   config_json TEXT NOT NULL DEFAULT '{}',      -- mode, cron expr, model override, notify policy
@@ -1086,14 +1252,43 @@ CREATE INDEX idx_task_runs ON task_runs(task_id, started_at DESC);
 ```
 
 A run that spawns a session gets its transcript for free via `session_id`.
+That transcript is identified as automation output by an `EXISTS` check against
+`task_runs` that every session summary and search hit carries as `scheduledRun`.
+The ownership is derived on read and never stored on the session row, so the
+SessionList and session search hide the transcript while it has a run, and
+deleting the task returns it to the ordinary lists instead of leaving it
+unreachable (issue #1291).
+`scheduled.listRuns` answers two shapes: one task's own history (`taskId`, at most
+200 rows) and one newest run per task (`latestPerTask`, one row per task, never
+combined with `taskId`). The task column reads the second shape. A global window
+over `task_runs` can be filled by one busy task — retention keeps the last 100
+runs *per task* — and would then report an idle task as never run, so the read
+that feeds the column is per task rather than a shared window.
+Retention keeps the newest 100 runs per task (`TASK_RUNS_KEEP`, applied on every
+boot). Ownership is derived from those rows, so a pruned run takes two things
+with it: the run leaves the task's history, and its session stops carrying
+`scheduledRun`, which returns that transcript to the SessionList and to session
+search. A task that runs faster than the kept window — an `interval` task from
+five minutes up, an hourly task after roughly four days — reaches that boundary;
+replacing the derived marker with a persistent origin is tracked with the rest
+of issue #1291.
+The task page also reads at most 200 runs per task, the bound
+`scheduled.listRuns` enforces for a single task's history.
 The existing JSON extension stores `schedule: {hour, minute, weekday}`,
-`nextRunAt` (epoch milliseconds) and `workspacePath` for desktop automations.
+`intervalMinutes` (5–1440; required by an `interval` cadence and read by no other
+one, so a schedule that keeps the field keeps its value), `nextRunAt` (epoch
+milliseconds), `workspacePath`, and `sessionMode` (`perRun` or `reuse`, absent
+means `perRun`) for desktop automations.
 Optional `weekdays` stores 1–7 unique integers in 0–6, overriding legacy
 `weekday` for weekly schedules. Missing `weekdays` preserves the single-day
 behavior. Invalid or empty selections are rejected before mutation. No table
 migration is needed. Daily/weekly schedules use the host local timezone; hourly
-schedules compute `nextRunAt = now + 3_600_000`, ignoring calendar fields. Absence
-of `schedule` leaves legacy tasks unarmed. No physical schema change is made.
+and interval schedules count elapsed time from the moment they were armed:
+hourly computes `nextRunAt = now + 3_600_000` and interval computes
+`nextRunAt = now + intervalMinutes × 60_000`, both ignoring calendar fields.
+An `interval` task whose schedule carries no `intervalMinutes` is refused rather
+than saved unarmed. Absence of `schedule` leaves legacy tasks unarmed. No
+physical schema change is made.
 Task wire fields project `schedule`, RFC3339 `nextRunAt`, `workspacePath` and the
 optional task-owned `permissionMode` plus paired `providerId`/`modelId` values.
 These additive values stay in `config_json`; no physical migration is required.
@@ -1351,24 +1546,21 @@ truncating at a guessed position.
 - JSON columns are read blind on hot paths (shipped to the renderer as-is);
   anything filtered or summed is a promoted column by rule.
 
-## 7. Versioning, v7 reset, and v8-to-v22 migration
+## 7. Versioning, v7 reset, and v8-to-v19 migration
 
-- `PRAGMA user_version` stays the schema authority; future structural changes
+- `PRAGMA user_version` stays the schema authority for the migration chain
+  shared with upstream PI-Desktop; future structural changes to that chain
   add ordered Rust migration fns again, each in one transaction, with a
-  `pi.sqlite.v<n>.bak` copy before destructive steps.
+  `pi.sqlite.v<n>.bak` copy before destructive steps. Plus-only structural
+  changes never advance it and run on the Plus track (section 7.1).
 - **v7 is a breaking reset (D119), not a migration.** Opening a database with
   `user_version` 1–6 WAL-checkpoints it, renames it to `pi.sqlite.v6.bak`
   (removing stale `-wal`/`-shm` siblings), and bootstraps a fresh v7 file.
   Sessions, providers, and settings from the old file are not carried over;
   the archive remains for manual recovery. All pre-v7 migration code
   (v1 `settings.sqlite` import, v2→v6 chain) is deleted.
-- Fresh installs run the full v22 DDL directly.
-- **Schema v21 to v22 is additive.** It adds approved execution provider/model
-  bindings and the durable `revision_intent_*` fields to `plan_approvals`,
-  creates `plan_execution_schedules`, and sets `PRAGMA user_version = 22`.
-  The migration creates a readable pre-change backup and preserves all existing
-  proposals, artifacts, transcripts, and recurring scheduled tasks. Legacy
-  proposals remain readable with absent optional bindings and schedule state.
+- Fresh installs run the full v19 DDL directly, then the Plus steps (section
+  7.1).
 - **Schema v7 first reaches v8, then uses the guarded path.** The v7→v8
   migration is followed by the same guarded v8→v15 migration; schema-v9 and
   schema-v10 databases take the same guarded path and receive an exact readable
@@ -1422,6 +1614,10 @@ truncating at a guessed position.
   step. The v15→v16 session-collaboration step now stamps `16` (its own version)
   instead of the latest schema constant, so a v15 file can walk both steps in one
   launch.
+- **Schema v20 is additive.** It adds nullable `turn_queue.user_message_id`
+  and `turn_queue.voice_origin_json`; existing queue rows remain valid and
+  unset. The migration keeps a v19 backup, and queue entries remain held until
+  the existing Agent Host controller attaches.
 - **Schema v14 is additive.** It adds nullable `sessions.deleted_at`, the
   partial deletion index, and `session_import_origins`. Existing sessions stay
   active and have no origin rows. The migration runs in the same guarded
@@ -1429,14 +1625,6 @@ truncating at a guessed position.
   integrity checks.
 - **Schema v18 to v19 is additive.** It adds the `omit` thinking level while
   preserving stored session settings (ADR 0295).
-- **Schema v19 to v20 is additive.** It adds
-  `plan_approvals.artifact_workspace_kind` and `goal_reports` (Goal completion
-  reports); a `pi.sqlite.v19.bak` copy precedes the transaction.
-- **Schema v20 to v21 is additive.** It adds `sessions.execution_profile` and
-  the `teams`, `team_members`, and `team_tasks` tables (ADR 0307). The step
-  also idempotently completes Goal v20 objects so either unreleased v20 branch
-  upgrades without discarding data. A `pi.sqlite.v20.bak` copy precedes the
-  transaction.
 
 The `largePasteThreshold` app setting is additive JSON rather than a database
 schema field. Host settings reads normalize a missing, malformed, or
@@ -1454,6 +1642,64 @@ destructive migration or a second settings store.
 - The transcript file format carries its own `schema` field in the session
   header line; unknown line types are skipped, so additive file-format growth
   needs no reset.
+
+### 7.1 Plus track
+
+`PRAGMA user_version` is reserved for the chain shared with upstream PI-Desktop
+and moves only when upstream migrations are merged (ADR
+plus-schema-version-track). Plus-only structures run on a second track in the
+same database, so merging upstream never renumbers or collides with Plus data.
+Plus steps are ordered, additive, and idempotent. They live in
+`crates/host-core/src/db/plus_schema.rs`, and the current track version is 4:
+
+| Step | Adds |
+|---|---|
+| P1 | `plan_approvals.artifact_workspace_kind` and the `goal_reports` table |
+| P2 | `sessions.execution_profile` and the `teams`, `team_members`, and `team_tasks` tables |
+| P3 | execution provider/model bindings and revision intent fields on `plan_approvals`, and the `plan_execution_schedules` table |
+| P4 | `plan_approvals.execution_kind`, backfilled from `kind` for approved proposals |
+
+P1 to P4 are the Plus-only changes earlier fork builds shipped as
+`user_version` 20 to 23. Every step probes before it changes anything, so a
+database from either unreleased historical v20 shape (Goal reports only, or
+workspace kind only) completes without discarding data, and legacy proposals
+stay readable with absent optional bindings and schedule state. A new Plus
+change appends a step and bumps the track version; an applied step is never
+edited.
+
+- **State.** `plus_schema_meta` holds one row (`id = 1`): `plus_version`, and
+  `upstream_version`, the `user_version` the last Plus-aware open left behind.
+- **Open sequence.** `Database::open` reconciles the Plus track, runs the
+  unchanged shared chain, then applies or re-verifies the Plus steps.
+- **Newer database.** A `plus_version` above the build's own is refused with
+  `Plus schema version N is newer than supported M`. Boot diagnostics treat it
+  like the shared-chain refusal (`DB_SCHEMA_TOO_NEW`, process model section on
+  boot outcomes).
+- **Legacy fork database.** A database with Plus structures, no
+  `plus_schema_meta`, and `user_version` 20 to 23 was written by an earlier fork
+  build. After a verified `pi.sqlite.legacy-v<N>.bak`, one transaction applies
+  every Plus step, writes the meta (track 4, shared 19), and sets
+  `user_version` to 19. A failure rolls the transaction back and leaves the
+  legacy database as it was.
+- **Older fork build.** An older fork build that opens a reconciled database
+  re-runs its own idempotent steps and leaves `user_version` at 20 to 23. The
+  next open of this build takes `pi.sqlite.repair-v<N>.bak` and restores the
+  `user_version` the meta recorded; no downgrade banner is shown.
+- **Pending steps.** A database that is behind on the Plus track takes
+  `pi.sqlite.plus-v<from>.bak`, then applies the missing steps and updates the
+  meta in one transaction. When the shared version moved during the open or
+  since the meta was written, all steps are replayed, because an upstream step
+  may have rebuilt a table that carries Plus columns, and the meta is
+  re-synced.
+- **Fresh installs.** A new database runs the shared v19 DDL, then every Plus
+  step, and records the track version. It takes no backup.
+- **Offline relocation.** The cold storage migration's `--relocate-data` pass
+  (section 2, user-selected storage location) opens SQLite directly and never
+  goes through `Database::open`, so it does not reconcile a legacy fork
+  database, take a Plus backup, or apply pending steps; the next normal open of
+  the relocated database does. Plus-owned records (Goal report files, review
+  snapshots, Expert Team write scopes) hold paths relative to the data root or
+  the project, so relocation has no path of theirs to rewrite.
 
 ## 8. Retention & maintenance
 
@@ -1615,6 +1861,11 @@ source-discriminated transcript authority owned by the Node agent sidecar. They
 are never inserted into SQLite and never copied to the Desktop transcript
 directory. `session.list` merges their projections with Rust-owned
 Desktop summaries, and `session.get` routes by the opaque `native-pi:` id.
+Discovery deduplicates native files that share the same JSONL `header.id`,
+keeping the projection with the newest transcript `updatedAt`. The selected
+file retains its path-derived opaque session id; duplicate files are not
+rewritten or deleted, and their paths are omitted from the in-memory lookup
+map for the current scan.
 
 Detail reads take an immutable byte snapshot, parse it into an in-memory
 `SessionManager`, and follow the current native branch. They must not call
@@ -1674,3 +1925,15 @@ Hourly rows retain their fields but require explicit calendar confirmation
 when converted. Known intent survives cadence changes and database reopen.
 This additive JSON key needs no table or schema-version migration. Older
 versions ignore the key and cannot enforce the new conversion guard.
+
+## Physical operation usage ledger
+
+Optional operation ID, origin, physical account/model and cost status augment
+existing message/turn usage. `session.recordUsage` merges identities into the
+existing turn `usage_json`; no schema migration or historical rewrite is needed.
+Identified records are idempotent across event replay, outbox retries, tool results
+and parent/subagent rollups. Legacy token-only rows remain readable and additive.
+An unknown price is distinct from a known zero price; partial known costs remain
+on the individual operations. Late usage targets its captured turn and does not
+revive it or debit the currently active turn. Immediate nested parent and owning
+Task remain separate optional transcript/event fields.

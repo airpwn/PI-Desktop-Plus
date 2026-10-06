@@ -19,10 +19,29 @@ export type ProviderModelsState = {
   /** Message from the failed live call; cached rows stay visible alongside it. */
   error?: string;
   source?: ProviderModelsSource;
+  /**
+   * The base URL the service actually answered on, when a sweep resolved one.
+   * The form shows and saves this address rather than a hidden rewrite.
+   */
+  effectiveBaseUrl?: string;
+  /**
+   * The base URL this answer belongs to. The form only adopts
+   * `effectiveBaseUrl` while its field still holds this address, so a URL typed
+   * since the probe is never reverted to an earlier result.
+   */
+  resolvedFrom?: string;
+  /** How the sweep asked, and the evidence behind the candidate that won. */
+  discoveryStyle?: string;
+  apiStyleHint?: string;
+  evidence?: string;
 };
 
 export type ProviderModelsDiscovery = ProviderModelsState & {
-  /** Probe the live endpoint now. Skips debounce and the cache-first paint. */
+  /**
+   * Probe the live endpoint now. Skips debounce and the cache-first paint, and
+   * marks the request as the user's explicit manual action so the main process
+   * may show macOS's supplemental Local Network alert.
+   */
   reload: () => void;
   /**
    * True when a live probe can start now. Idle-with-a-valid-URL (the edit
@@ -78,7 +97,7 @@ export function useProviderModels(
   const modelsRef = useRef(state.models);
   modelsRef.current = state.models;
 
-  const run = async (requestId: number, options?: { skipCache?: boolean }) => {
+  const run = async (requestId: number, options?: { skipCache?: boolean; manual?: boolean }) => {
     const {
       active: isActive,
       baseUrl: url,
@@ -118,20 +137,41 @@ export function useProviderModels(
 
     try {
       // No `source` field: that is what selects the live branch in the host
-      // handler, which asks the service first and models.dev only after.
+      // handler, which asks the service first and models.dev only after. Only
+      // the manual action carries `intent`; the edit debounce and the saved-list
+      // refresh stay automatic and must never trigger a network-permission alert.
       const result = await api.listProviderModels({
         ...(id ? { providerId: id } : {}),
         baseUrl: url.trim(),
         ...(key ? { apiKey: key } : {}),
         apiStyle: style,
         ...(Object.keys(hdrs ?? {}).length > 0 ? { headers: hdrs } : {}),
+        ...(options?.manual ? { intent: "manual-fetch-list" as const } : {}),
       });
       if (requestSeq.current !== requestId) return;
+      /*
+        A resolution result travels with the list: the address that answered and
+        the evidence behind it are what the form shows, so automatic endpoint
+        completion never becomes invisible behaviour.
+
+        `resolvedFrom` is the address this answer belongs to. The form compares
+        a field against it before adopting the answer, which is what keeps a URL
+        typed since the probe from being reverted to an earlier result.
+      */
+      const resolution = {
+        ...(result.effectiveBaseUrl
+          ? { effectiveBaseUrl: result.effectiveBaseUrl, resolvedFrom: url }
+          : {}),
+        ...(result.discoveryStyle ? { discoveryStyle: result.discoveryStyle } : {}),
+        ...(result.apiStyleHint ? { apiStyleHint: result.apiStyleHint } : {}),
+        ...(result.evidence ? { evidence: result.evidence } : {}),
+      };
       if (result.models.length > 0) {
         setState({
           status: "ready",
           models: result.models,
           source: result.source,
+          ...resolution,
           ...(result.error ? { error: result.error } : {}),
         });
       } else {
@@ -140,6 +180,7 @@ export function useProviderModels(
           status: "error",
           models: cachedModels,
           source: result.source,
+          ...resolution,
           ...(result.error ? { error: result.error } : {}),
         });
       }
@@ -175,10 +216,12 @@ export function useProviderModels(
     return () => clearTimeout(timer);
   }, [active, baseUrl, apiKey, apiStyle, headersKey, providerId]);
 
+  /* The Fetch list control is the user's explicit manual action, so its request
+     is the only one marked as manual. */
   const reload = () => {
     if (!paramsRef.current.active || !canDiscover(paramsRef.current.baseUrl)) return;
     const requestId = ++requestSeq.current;
-    void run(requestId, { skipCache: true });
+    void run(requestId, { skipCache: true, manual: true });
   };
 
   const canReload =
